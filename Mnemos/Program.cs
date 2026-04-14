@@ -1,149 +1,204 @@
-﻿using System;
-using System.IO;
-using System.Text.Json;
-using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
+﻿namespace Mnemos;
 
-namespace Mnemos
+class Program
 {
-    class Program
+    private static readonly string BlobRoot = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        @"Claude\IndexedDB\https_claude.ai_0.indexeddb.blob\1"
+    );
+
+    private static readonly string OutputFile = "conversations.txt";
+
+    static async Task Main(string[] args)
     {
-        static async Task Main(string[] args)
+        Console.Clear();
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("╔══════════════════════════════════════╗");
+        Console.WriteLine("║         MNEMOS v4.0 - MOTEUR         ║");
+        Console.WriteLine("╚══════════════════════════════════════╝\n");
+        Console.ResetColor();
+
+        if (args.Contains("--sync"))
         {
-            Console.Clear();
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine("╔═══════════════════════════════════════════════════╗");
-            Console.WriteLine("║      MNEMOS v3.0 - INTERCEPTION LEVELDB DIRECTE   ║");
-            Console.WriteLine("╚═══════════════════════════════════════════════════╝\n");
+            Console.WriteLine("[SYNC] Extraction de tout l'historique...\n");
+            SyncAll();
+        }
+        else if (args.Contains("--watch"))
+        {
+            Console.WriteLine("[WATCH] Écoute en temps réel...\n");
+            await WatchAsync();
+        }
+        else
+        {
+            Console.WriteLine("Choisir un mode :");
+            Console.WriteLine("  [1] --sync    Extraire tout l'historique");
+            Console.WriteLine("  [2] --watch   Écouter en temps réel");
+            Console.Write("\nChoix : ");
+
+            string? choice = Console.ReadLine();
+            if (choice == "1") SyncAll();
+            else if (choice == "2") await WatchAsync();
+            else Console.WriteLine("Choix invalide.");
+        }
+    }
+
+    // ── SYNC ──────────────────────────────────────────────────────────────
+    static void SyncAll()
+    {
+        var allConversations = new List<Conversation>();
+
+        foreach (var dir in Directory.GetDirectories(BlobRoot).OrderBy(d => d))
+        {
+            foreach (var blobPath in Directory.GetFiles(dir))
+            {
+                var convs = ProcessBlob(blobPath);
+                if (convs.Count > 0)
+                {
+                    allConversations.AddRange(convs);
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"[+] {Path.GetFileName(dir)} → {convs.Count} conversation(s)");
+                    Console.ResetColor();
+                }
+            }
+        }
+
+        Console.WriteLine($"\n[i] Total : {allConversations.Count} conversations extraites");
+        WriteToFile(allConversations);
+        Console.WriteLine($"[i] Sauvegardé dans {OutputFile}");
+    }
+
+    // ── WATCH ─────────────────────────────────────────────────────────────
+    static async Task WatchAsync()
+{
+    using var cts = new CancellationTokenSource();
+    Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
+    Console.WriteLine("[i] En écoute... (Ctrl+C pour arrêter)\n");
+
+    string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+    string levelDbDir = Path.Combine(appData, @"Claude\IndexedDB\https_claude.ai_0.indexeddb.leveldb");
+
+    // Thread 1 : LevelDB .log → drafts live
+    var logTask = Task.Run(async () =>
+    {
+        try
+        {
+            string? logFile = Directory.GetFiles(levelDbDir, "*.log")
+                .OrderByDescending(f => new FileInfo(f).LastWriteTime)
+                .FirstOrDefault();
+
+            if (logFile == null) return;
+
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"[LOG] Surveillance : {Path.GetFileName(logFile)}");
             Console.ResetColor();
 
-            // 1. Trouver le dossier et le fichier .log le plus récent
-            string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            string levelDbDir = Path.Combine(appData, @"Claude\IndexedDB\https_claude.ai_0.indexeddb.leveldb");
-
-            if (!Directory.Exists(levelDbDir))
+            using var reader = new LevelDbLogReader(logFile);
+            await foreach (var record in reader.ReadRecordsAsync(cts.Token))
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[!] Dossier LevelDB introuvable : {levelDbDir}");
-                Console.ResetColor();
-                return;
-            }
+                if (!record.IsLive) continue;
+                Console.WriteLine($"[KEY] {record.Key[..Math.Min(50, record.Key.Length)]}");
 
-            string currentLogFile = GetLatestLogFile(levelDbDir);
-            if (currentLogFile == null)
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("[!] Aucun fichier .log trouvé.");
-                Console.ResetColor();
-                return;
-            }
+                if (!record.Key.Contains("chat-draft")) continue;
 
-            Console.WriteLine($"[i] Surveillance attachée à : {Path.GetFileName(currentLogFile)}");
-            Console.WriteLine(new string('-', 50));
-
-            // Gestion de l'arrêt propre (Ctrl+C)
-            using var cts = new CancellationTokenSource();
-            Console.CancelKeyPress += (s, e) =>
-            {
-                Console.WriteLine("\n[i] Arrêt de Mnemos...");
-                e.Cancel = true;
-                cts.Cancel();
-            };
-
-            // 2. Démarrer le lecteur
-            using var reader = new LevelDbLogReader(currentLogFile);
-
-            try
-            {
-                // Boucle asynchrone pour lire les événements en temps réel
-                await foreach (var record in reader.ReadRecordsAsync(cts.Token))
-                {
-                    // Si ce n'est pas une insertion (c'est une suppression), on ignore
-                    if (!record.IsLive) continue;
-
-                    string key = record.Key;
-                    string rawValue = record.ValueString;
-
-                    if (key.Contains("chat-draft"))
-                    {
-                        ProcessDraft(key, rawValue);
-                    }
-                    else if (key.Contains("react-query-cache"))
-                    {
-                        ProcessCache(key, rawValue);
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Fin normale via Ctrl+C
-            }
-            catch (Exception ex)
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[!] Erreur critique : {ex.Message}");
+                Console.ForegroundColor = ConsoleColor.DarkYellow;
+                Console.WriteLine($"[DRAFT] {DateTime.Now:HH:mm:ss} {record.ValueString[..Math.Min(100, record.ValueString.Length)]}");
                 Console.ResetColor();
             }
         }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Console.WriteLine($"[LOG ERR] {ex.Message}"); }
+    });
 
-        private static string GetLatestLogFile(string dir)
+    // Thread 2 : Blobs → messages complets après flush
+    var blobTask = Task.Run(async () =>
+    {
+        try
         {
-            var files = new DirectoryInfo(dir).GetFiles("*.log");
-            if (files.Length == 0) return null;
-            
-            // Trie par date de modification décroissante
-            Array.Sort(files, (a, b) => b.LastWriteTime.CompareTo(a.LastWriteTime));
-            return files[0].FullName;
-        }
-
-        private static void ProcessDraft(string key, string rawValue)
-        {
-            // Les brouillons sont généralement en clair ou facilement parsables
-            try
+            using var watcher = new BlobWatcher(BlobRoot);
+            await foreach (var convs in watcher.WatchAsync(cts.Token))
             {
-                // On nettoie les caractères binaires du début/fin si nécessaire
-                string cleanJson = Regex.Replace(rawValue, @"[^\x20-\x7E\xA0-\xFF]", "");
-                
-                // Extraction rapide du texte si ça ressemble à du JSON
-                var match = Regex.Match(cleanJson, @"text"":""(.*?)""");
-                if (match.Success)
+                foreach (var conv in convs)
                 {
-                    string text = match.Groups[1].Value;
-                    if (!string.IsNullOrWhiteSpace(text) && text.Length > 3)
-                    {
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.WriteLine($"\n[BROUILLON EN DIRECT] {DateTime.Now:HH:mm:ss}");
-                        Console.ResetColor();
-                        Console.WriteLine(text);
-                    }
-                }
-            }
-            catch { /* Ignorer les erreurs de parse */ }
-        }
-
-        private static void ProcessCache(string key, string rawValue)
-        {
-            // Le cache (react-query) contient souvent le fameux "Blink SSV" + "V8 Serialized"
-            // On utilise la technique du Sniper Regex pour extraire le texte français/anglais lisible
-            MatchCollection matches = Regex.Matches(rawValue, @"[a-zA-Z0-9éèàêîôû' \.,!?]{30,}");
-
-            foreach (Match match in matches)
-            {
-                string phrase = match.Value.Trim();
-
-                // On évite d'afficher le code interne de l'application ou les UUID
-                if (!phrase.Contains("u00") && 
-                    !phrase.Contains("http") && 
-                    !phrase.Contains("tipTap") &&
-                    !Regex.IsMatch(phrase, @"^[a-f0-9\-]{36}$"))
-                {
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"\n[MESSAGE CACHE] {DateTime.Now:HH:mm:ss}");
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"\n[CONV] {conv.Name}");
                     Console.ResetColor();
-                    Console.WriteLine(phrase);
+                    foreach (var msg in conv.Messages.TakeLast(2))
+                        PrintMessage(msg);
                 }
             }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Console.WriteLine($"[BLOB ERR] {ex.Message}"); }
+    });
+
+    await Task.WhenAll(logTask, blobTask);
+}
+
+    // ── HELPERS ───────────────────────────────────────────────────────────
+    static List<Conversation> ProcessBlob(string path)
+    {
+        try
+        {
+            byte[]? v8Data = SnappyDecompressor.Decompress(path);
+            if (v8Data == null) return [];
+
+            var deserializer = new V8Deserializer(v8Data);
+            object? root = deserializer.Deserialize();
+
+            return ConversationExtractor.Extract(root);
+        }
+        catch { return []; }
+    }
+
+    static IEnumerable<string> GetAllBlobs()
+        => Directory.GetDirectories(BlobRoot)
+                    .OrderBy(d => d)
+                    .SelectMany(Directory.GetFiles);
+
+    static void PrintMessage(ChatMessage msg)
+    {
+        Console.ForegroundColor = msg.Sender == "human"
+            ? ConsoleColor.White
+            : ConsoleColor.Green;
+
+        Console.WriteLine($"[{msg.Sender.ToUpper()}] {msg.CreatedAt[..19]}");
+        Console.ResetColor();
+
+        if (!string.IsNullOrEmpty(msg.Text))
+            Console.WriteLine(msg.Text.Length > 300
+                ? msg.Text[..300] + "..."
+                : msg.Text);
+
+        if (msg.Thinking != null)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"  [thinking] {msg.Thinking[..Math.Min(100, msg.Thinking.Length)]}...");
+            Console.ResetColor();
+        }
+
+        Console.WriteLine();
+    }
+
+    static void WriteToFile(List<Conversation> conversations)
+    {
+        using var writer = new StreamWriter(OutputFile, false);
+        foreach (var conv in conversations.OrderBy(c => c.CreatedAt))
+        {
+            writer.WriteLine($"{'='* 60}");
+            writer.WriteLine($"CONVERSATION : {conv.Name}");
+            writer.WriteLine($"UUID         : {conv.Uuid}");
+            writer.WriteLine($"DATE         : {conv.CreatedAt}");
+            writer.WriteLine($"{'='* 60}");
+
+            foreach (var msg in conv.Messages)
+            {
+                writer.WriteLine($"\n[{msg.Sender.ToUpper()}] {msg.CreatedAt}");
+                writer.WriteLine(msg.Text);
+                if (msg.Thinking != null)
+                    writer.WriteLine($"[THINKING] {msg.Thinking}");
+            }
+
+            writer.WriteLine();
         }
     }
 }
