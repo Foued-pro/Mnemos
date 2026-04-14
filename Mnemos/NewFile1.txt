@@ -1,0 +1,15 @@
+﻿Ce qu'on a confirmé sur le fichier :
+
+Taille : 2.17MB, pas de Snappy, V8 pur
+Plusieurs objets V8 concaténés dans le même fichier (~100+ headers FF XX)
+Versions V8 multiples dans le même fichier (v9 à v31) — bizarre
+Premier objet à 0x0010 contient clairement conversations_v2 et buster → c'est la clé react-query
+Tag 0xFE présent = host objects Blink → c'est ça qui fait crasher v8.deserialize()
+Strings lisibles : UUIDs, timestamps ISO, sender, assistant, du texte de messages
+
+Ce qu'on ne sait pas encore :
+
+Structure exacte du wrapper Blink avant chaque objet V8
+Comment sont délimités les objets entre eux
+Ce que contiennent les host objects 0xFE — données importantes ou metadata à skipper ?
+Schema exact de conversations_v2
