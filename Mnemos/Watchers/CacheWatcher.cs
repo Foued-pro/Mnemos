@@ -2,6 +2,7 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using ZstdSharp;
+using Mnemos.Models;
 
 namespace Mnemos;
 

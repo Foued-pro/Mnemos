@@ -1,10 +1,10 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Mnemos.Database;
+using Mnemos.Models;
+using Mnemos.Search;
+using Mnemos.Mcp;
+using Microsoft.Extensions.Logging; 
 namespace Mnemos;
 
 class Program
@@ -21,8 +21,27 @@ class Program
 
     private static readonly string OutputFile = "conversations.txt";
 
+    // Base de données
+    private static readonly MnemosDb Db = new(
+        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mnemos.db")
+    );
+
     static async Task Main(string[] args)
     {
+        // === MODE MCP (Model Context Protocol) - DOIT ÊTRE EN PREMIER ===
+        if (args.Contains("--mcp"))
+        {
+            McpTools.Init(Db);
+            var builder = Host.CreateApplicationBuilder(args);
+            builder.Logging.ClearProviders(); // ← supprime les logs stdout
+            builder.Services.AddMcpServer()
+                .WithStdioServerTransport()
+                .WithToolsFromAssembly();
+            await builder.Build().RunAsync();
+            return;
+        }
+
+        // === Mode normal (console interactive) ===
         Console.Clear();
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine("╔══════════════════════════════════════╗");
@@ -30,6 +49,17 @@ class Program
         Console.WriteLine("╚══════════════════════════════════════╝\n");
         Console.ResetColor();
 
+        // === AUTO-SYNC si la base est vide ===
+        var (existingConvs, existingMsgs) = Db.GetStats();
+        if (existingMsgs == 0)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("[AUTO-SYNC] Base vide, extraction initiale automatique...\n");
+            Console.ResetColor();
+            SyncAll();
+        }
+
+        // Gestion des arguments ou menu interactif
         if (args.Contains("--sync"))
         {
             SyncAll();
@@ -43,11 +73,13 @@ class Program
             Console.WriteLine("Choisir un mode :");
             Console.WriteLine("  [1] Extraire tout l'historique");
             Console.WriteLine("  [2] Voir les conversations en temps réel");
+            Console.WriteLine("  [3] Rechercher dans la mémoire");
             Console.Write("\nChoix : ");
 
             string? choice = Console.ReadLine();
             if (choice == "1") SyncAll();
             else if (choice == "2") await WatchAsync();
+            else if (choice == "3") SearchHandler.Run(Db);
             else Console.WriteLine("Choix invalide.");
         }
     }
@@ -103,6 +135,10 @@ class Program
 
         if (allConversations.Count > 0)
         {
+            Db.SaveConversations(allConversations);
+            var (convs, msgs) = Db.GetStats();
+            Console.WriteLine($"[DB] {convs} conversations, {msgs} messages en base");
+
             WriteToFile(allConversations);
             Console.WriteLine($"[i] Sauvegardé dans {OutputFile}");
         }
@@ -127,6 +163,13 @@ class Program
                 {
                     foreach (var conv in convs)
                     {
+                        Db.SaveConversations([conv]);
+
+                        var (c, m) = Db.GetStats();
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.WriteLine($"[DB] {c} convs, {m} msgs");
+                        Console.ResetColor();
+
                         Console.ForegroundColor = ConsoleColor.Cyan;
                         Console.WriteLine($"\n╔══ {conv.Name}");
                         Console.ResetColor();
@@ -149,7 +192,10 @@ class Program
             }
         });
 
-        try { await cacheTask; }
+        try 
+        { 
+            await cacheTask; 
+        }
         catch (OperationCanceledException)
         {
             Console.WriteLine("\n[i] Arrêté.");
@@ -168,7 +214,10 @@ class Program
             object? root = deserializer.Deserialize();
             return ConversationExtractor.Extract(root);
         }
-        catch { return []; }
+        catch 
+        { 
+            return []; 
+        }
     }
 
     static void PrintMessage(ChatMessage msg)

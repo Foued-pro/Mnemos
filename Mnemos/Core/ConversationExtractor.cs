@@ -1,20 +1,6 @@
-﻿namespace Mnemos;
+﻿using Mnemos.Models;
 
-public record ChatMessage(
-    string Uuid,
-    string Sender,
-    string Text,
-    string? Thinking,
-    string CreatedAt,
-    string ConversationUuid
-);
-
-public record Conversation(
-    string Uuid,
-    string Name,
-    string CreatedAt,
-    List<ChatMessage> Messages
-);
+namespace Mnemos;
 
 public static class ConversationExtractor
 {
