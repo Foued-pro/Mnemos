@@ -9,12 +9,28 @@ public static class SnappyDecompressor
 
     public static byte[]? Decompress(string path)
     {
-        byte[] raw = File.ReadAllBytes(path);
-        if (raw.Length < 3) return null;
+        byte[]? raw = null;
+    
+        // Tentatives de lecture sécurisées (bypass du File Lock de Chromium)
+        for (int i = 0; i < 5; i++) 
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var ms = new MemoryStream();
+                fs.CopyTo(ms);
+                raw = ms.ToArray();
+                break; // Succès, on sort de la boucle
+            }
+            catch (IOException)
+            {
+                Thread.Sleep(100); // Verrouillé, on attend 100ms et on retente
+            }
+        }
 
-        if (raw[0] != SnappyHeader[0] ||
-            raw[1] != SnappyHeader[1] ||
-            raw[2] != SnappyHeader[2])
+        if (raw == null || raw.Length < 3) return null;
+
+        if (raw[0] != SnappyHeader[0] || raw[1] != SnappyHeader[1] || raw[2] != SnappyHeader[2])
             return null;
 
         byte[] decompressed = Snappy.DecompressToArray(raw[3..]);

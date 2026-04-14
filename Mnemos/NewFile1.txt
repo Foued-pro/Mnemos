@@ -13,3 +13,363 @@ Structure exacte du wrapper Blink avant chaque objet V8
 Comment sont délimités les objets entre eux
 Ce que contiennent les host objects 0xFE — données importantes ou metadata à skipper ?
 Schema exact de conversations_v2
+## Tout ce qu'on sait sur les `.ldb`
+
+### Ce qu'on a confirmé
+
+Les `.ldb` sont des **LevelDB SSTable files** — fichiers compactés, format binaire Google. Dans le dossier :
+```
+C:\Users\Subaru\AppData\Roaming\Claude\IndexedDB\https_claude.ai_0.indexeddb.leveldb\
+```
+
+Fichiers présents :
+```
+000113.ldb  — 16 687 bytes
+000114.ldb  — 501 412 bytes  ← le plus gros, contient les données
+000118.log  — 0 bytes        ← vide
+MANIFEST-000117
+```
+
+On a inspecté `000114.ldb` avec un script Python regex et trouvé **des drafts en clair JSON** :
+```json
+{"state":{"tipTapEditorState":{"type":"doc","content":[{"type":"text","text":"att tiens..."}]}}}
+```
+
+Structure d'un draft :
+```json
+{
+  "state": {
+    "tipTapEditorState": {
+      "type": "doc", 
+      "content": [{"type": "text", "text": "TON MESSAGE"}]
+    }
+  },
+  "version": 1,
+  "updatedAt": 1776109066910
+}
+```
+
+### Ce qu'on ne sait pas encore
+
+- Est-ce que les **vraies conversations** (`chat_conversation_tree`) sont aussi dans les `.ldb` ou seulement les drafts ?
+- Format exact d'un record SSTable LevelDB pour le parser proprement en C#
+
+### Format SSTable LevelDB (théorie)
+
+Un fichier `.ldb` SSTable contient :
+```
+[Data Blocks]     — blocs de données key/value compressés (Snappy optionnel)
+[Filter Block]    — bloom filter
+[Meta Index Block]
+[Index Block]     — index des data blocks
+[Footer]          — 48 bytes fixes à la fin, magic number: 0x57fb808b24e37b88
+```
+
+Chaque data block contient des **records** :
+```
+[shared_key_len varint]
+[unshared_key_len varint]  
+[value_len varint]
+[key_delta bytes]
+[value bytes]
+```
+
+Les clés sont **prefix-compressed** — chaque clé partage un préfixe avec la précédente.
+
+### Ce qui reste à faire
+
+**Priorité 1 — Vérifier si les convos sont dans les `.ldb`** :
+```python
+import re
+
+LDB = r"C:\Users\Subaru\AppData\Roaming\Claude\IndexedDB\https_claude.ai_0.indexeddb.leveldb\000114.ldb"
+
+with open(LDB, 'rb') as f:
+    data = f.read()
+
+for m in re.finditer(rb'chat_conversation_tree[^\x00]{0,500}', data):
+    print(f"[0x{m.start():08x}] {m.group().decode(errors='replace')[:200]}")
+```
+
+**Priorité 2 — Si oui**, écrire un `SstableReader.cs` en C# :
+- Lire le footer (48 derniers bytes) → trouver l'index block
+- Parser l'index block → liste des data blocks
+- Pour chaque data block → décompresser Snappy si nécessaire → extraire les key/value
+- Filtrer les clés qui contiennent `chat_conversation_tree`
+- Les valeurs sont du **V8 SSV** — même pipeline que pour les blobs mais sans le header `FF 11 02`
+
+**Priorité 3 — Intégrer dans le `--sync`** de Mnemos :
+```
+--sync
+  ├── Blobs (grandes convos)     → SnappyDecompressor → V8Deserializer → déjà fait ✅
+  └── SSTable .ldb (petites convos) → SstableReader → V8Deserializer → à faire
+```
+
+### Projet Mnemos — état actuel
+
+```
+SnappyDecompressor.cs  ✅ — détecte FF 11 02, décompresse Snappy, skip 15 bytes Blink
+V8Deserializer.cs      ✅ — désérialise le stream V8 en Dictionary/List C#
+ConversationExtractor.cs ✅ — extrait chat_conversation_tree → conversations + messages
+Program.cs             ✅ — --sync (blobs) + --watch (détecte nouveaux blobs)
+BlobWatcher.cs         ✅ — FileSystemWatcher sur le dossier blob
+LevelDbLogReader.cs    ⚠️  — lit les .log mais ils sont vides, à revoir pour .ldb
+SstableReader.cs       ❌  — pas encore fait
+MnemosDb.cs (SQLite)   ❌  — pas encore fait
+MCP server             ❌  — pas encore fait
+```
+
+### Ce que --sync extrait déjà
+
+- 3 conversations des blobs `2b` et `2c`
+- 18 960 lignes de messages avec sender, text, thinking, timestamps
+- Fichier `conversations.txt` généré
+
+### Prochaines étapes dans l'ordre
+
+1. Vérifier si `chat_conversation_tree` est dans les `.ldb` avec le script Python
+2. Si oui → coder `SstableReader.cs`
+3. SQLite — schema : `conversations` + `messages` avec FTS5
+4. MCP server — `search_conversations(query)` + `get_context(project)`
+
+
+# Mnemos — Reverse Engineering de l'IndexedDB de Claude Desktop
+
+## TL;DR
+
+Extraction complète de l'historique des conversations Claude Desktop en C# pur, sans lib tierce, par reverse engineering du format de stockage propriétaire Chromium/Blink/V8.
+
+---
+
+## Contexte
+
+Claude Desktop (Electron) stocke les conversations localement dans une IndexedDB Chromium. Aucune documentation publique sur le format exact. L'objectif : lire ces données programmatiquement pour construire **Mnemos**, un système de mémoire persistante pour Claude via MCP.
+
+---
+
+## Les tentatives qui ont échoué
+
+### Tentative 1 — LevelDB.NET direct
+Lecture de la base LevelDB en C# avec le wrapper existant.
+
+**Résultat :** `Corruption: corrupted compressed block contents`
+
+**Cause :** Le wrapper C# ne gère pas l'implémentation Snappy de Chromium (flags de compilation différents).
+
+### Tentative 2 — Scraping binaire brute force
+Lecture des fichiers `.blob` en `byte[]`, extraction des séquences ASCII/UTF-8 avec Regex.
+
+**Résultat :** Texte fragmenté, phrases coupées au milieu, inutilisable.
+
+**Cause :** Les pointeurs de compression Snappy et les marqueurs V8 coupent les strings.
+
+### Tentative 3 — ccl_chromium_reader (Python)
+Utilisation de la lib spécialisée CCL pour décoder Snappy + V8.
+
+**Résultat :** `RecursionError` sur la clé `react-query-cache`.
+
+**Cause :** Références circulaires dans l'objet V8, non gérées par CCL.
+
+### Tentative 4 — v8.deserialize() Node.js natif
+Tentative de désérialisation directe avec le vrai moteur V8 de Node.js.
+
+**Résultat :** `Unable to deserialize cloned data due to invalid or unsupported version`
+
+**Cause :** Host objects Blink (`0x5C`) dans le stream V8 — Node n'a pas le delegate Blink pour les gérer.
+
+---
+
+## La vraie structure du fichier blob
+
+### Étape 1 — Identifier la compression
+
+Inspection des premiers bytes du fichier blob (`2cb0`, 2.17MB) :
+
+```
+FF 11 02 C1 C8 D9 02 0C ...
+```
+
+En lisant `idb_value_wrapping.cc` dans le source Chromium :
+
+```cpp
+static const uint8_t kReplaceWithBlob = 1;
+static const uint8_t kCompressedWithSnappy = 2;
+
+wire_data_buffer_[0] = static_cast<uint8_t>(kVersionTag);  // 0xFF
+wire_data_buffer_[1] = kRequiresProcessingSSVPseudoVersion; // 0x11
+wire_data_buffer_[2] = kCompressedWithSnappy;               // 0x02
+```
+
+**Conclusion :** `FF 11 02` = header 3 bytes fixe. Ce qui suit = Snappy raw (sans framing).
+
+### Étape 2 — Décompression Snappy
+
+```python
+import snappy
+data = open('2cb0', 'rb').read()
+decompressed = snappy.decompress(data[3:])  # skip FF 11 02
+# 2 171 261 bytes → 5 661 761 bytes décompressés
+```
+
+### Étape 3 — Identifier le wrapper Blink
+
+Premiers bytes après décompression :
+
+```
+FF 15 FE 00 00 00 00 00 00 00 00 00 00 00 00 FF 0F 6F 22 06 62 75 73 74 65 72
+```
+
+Décodage :
+- `FF 15` → Blink version 21
+- `FE 00 00 ... (x13)` → table des blobs externes (13 bytes de padding)
+- `FF 0F` → V8 version 15 ← début du vrai stream V8
+
+**Offset exact : 15 bytes** à skipper après décompression.
+
+Confirmé empiriquement en testant tous les offsets 0 à 30 avec `v8.deserialize()` — succès uniquement à offset 15.
+
+### Étape 4 — Lire le stream V8
+
+Après décompression + skip 15 bytes, `v8.deserialize()` Node.js retourne :
+
+```json
+{
+  "buster": "conversations_v2",
+  "timestamp": 1776152190198,
+  "clientState": {
+    "mutations": [],
+    "queries": [...]
+  }
+}
+```
+
+### Étape 5 — Trouver les conversations
+
+12 queries dans `clientState.queries`. Les conversations sont dans les queries avec `queryKey[0] == "chat_conversation_tree"` :
+
+```json
+{
+  "queryKey": ["chat_conversation_tree", {"orgUuid": "..."}, {"uuid": "..."}],
+  "state": {
+    "data": {
+      "uuid": "788f3d8f-...",
+      "name": "Obsidian et Claude Desktop : mythe ou réalité",
+      "chat_messages": [...]
+    }
+  }
+}
+```
+
+### Structure d'un message
+
+```json
+{
+  "uuid": "019d7e79-...",
+  "sender": "assistant",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "The user is asking about..."
+    },
+    {
+      "type": "text", 
+      "text": "Oui c'est réel, mais y'a du marketing dedans..."
+    }
+  ],
+  "created_at": "2026-04-11T21:36:54.934520Z",
+  "parent_message_uuid": "019d7e79-..."
+}
+```
+
+---
+
+## Pipeline final
+
+```
+fichier .blob
+  └── [0:3]   FF 11 02          → header Snappy (3 bytes fixe)
+  └── [3:]    données compressées
+      └── Snappy.Decompress()
+          └── [0:15]  wrapper Blink (skip)
+          └── [15:]   V8 SSV pur
+              └── V8Deserializer.Deserialize()
+                  └── clientState.queries[]
+                      └── queryKey[0] == "chat_conversation_tree"
+                          └── state.data.chat_messages[]
+                              └── sender + content[].text + thinking
+```
+
+---
+
+## Implémentation C#
+
+### SnappyDecompressor.cs
+
+Détection du header `FF 11 02`, décompression Snappy (NuGet Snappier), skip 15 bytes Blink.
+
+### V8Deserializer.cs
+
+Désérialiseur V8 from scratch. Opcodes implémentés confirmés sur les données réelles :
+
+| Opcode | Tag | Description |
+|--------|-----|-------------|
+| `0xFF` | kVersion | Header version, skip |
+| `0x54` | `T` | true |
+| `0x46` | `F` | false |
+| `0x30` | `0` | null |
+| `0x49` | `I` | int32 zigzag encoded |
+| `0x55` | `U` | uint32 |
+| `0x4E` | `N` | double (8 bytes LE) |
+| `0x22` | `"` | string Latin-1 |
+| `0x63` | `c` | string UTF-16LE |
+| `0x6F` | `o` | begin object |
+| `0x7B` | `{` | end object |
+| `0x41` | `A` | dense array |
+| `0x24` | `$` | end dense array |
+| `0x61` | `a` | sparse array |
+| `0x44` | `D` | Date |
+| `0x5E` | `^` | object reference |
+| `0x5C` | `\` | host object Blink (skip) |
+
+### ConversationExtractor.cs
+
+Navigation dans l'arbre d'objets désérialisés, extraction des `chat_conversation_tree` queries, reconstruction des conversations et messages.
+
+---
+
+## Résultats
+
+- **18 960 lignes** de conversations extraites proprement
+- **Thinking blocks** inclus (raisonnement interne de Claude)
+- **Timestamps** précis à la microseconde
+- **Arbre de conversation** préservé via `parent_message_uuid`
+- Fonctionne sur tous les blobs `00` → `2c`
+
+---
+
+## Ce qui est remarquable
+
+La plupart des projets similaires s'arrêtent à l'étape 1 ou utilisent des outils existants (ccl_chromium_reader, dfindexeddb). Ici :
+
+- Lecture directe de `idb_value_wrapping.cc` source Chromium pour identifier le header Snappy
+- Identification empirique de l'offset Blink (15 bytes) par bruteforce d'offsets
+- Désérialiseur V8 écrit from scratch en C# sans référence directe au code V8
+- Zéro dépendance tierce pour le parsing (juste Snappier pour Snappy)
+
+---
+
+## Stack technique
+
+- **C# / .NET 9**
+- **Snappier** (NuGet) — décompression Snappy
+- **Sources Chromium** — reverse engineering du format
+- **Python + node-snappy** — phase d'investigation
+
+---
+
+## Prochaines étapes
+
+- [ ] SQLite — stockage persistant des conversations
+- [ ] FTS5 — full text search sur les messages  
+- [ ] MCP server — exposition via Model Context Protocol
+- [ ] `--watch` mode — détection automatique des nouveaux blobs après flush
