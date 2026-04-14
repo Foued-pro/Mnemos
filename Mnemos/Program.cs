@@ -20,10 +20,9 @@ class Program
     );
 
     private static readonly string OutputFile = "conversations.txt";
-
-    // Base de données
+    
     private static readonly MnemosDb Db = new(
-        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mnemos.db")
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"Claude\mnemos.db")
     );
 
     static async Task Main(string[] args)

@@ -94,7 +94,7 @@ public class MnemosDb : IDisposable
                 content_rowid='rowid',
                 tokenize='trigram'
             );
-
+                   
             -- Triggers FTS5 messages
             CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
                 INSERT INTO messages_fts(rowid, text, thinking)

@@ -13,9 +13,12 @@ public static class McpTools
     public static void Init(MnemosDb db) => _db = db;
 
     [McpServerTool, Description(
-        "Recherche dans la mémoire des conversations passées avec Claude. " +
-        "Utilise cette tool pour retrouver du contexte sur un projet, " +
-        "une conversation précédente, ou une information technique discutée.")]
+         "ATTENTION : Ceci est une recherche FTS5 stricte (mots-clés exacts), PAS une recherche sémantique ! " +
+         "Pour trouver une information, tu DOIS obligatoirement utiliser l'opérateur OR avec de multiples synonymes, " +
+         "traductions et termes liés. " +
+         "Exemples: Au lieu de 'salle', cherche 'salle OR gym OR entrainement OR fitness'. " +
+         "Au lieu de 'code', cherche 'code OR script OR python OR c# OR bug'. " +
+         "Évite les mots trop courts qui pourraient créer de faux positifs (ex: évite 'pecs' qui matche 'specs').")]
     public static string search_memory(
         [Description("Le texte à rechercher dans l'historique des conversations")]
         string query,
