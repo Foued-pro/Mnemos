@@ -1,395 +1,215 @@
-﻿# Mnemos — Reverse Engineering de l'IndexedDB de Claude Desktop
+﻿# Reverse engineering Claude Desktop's storage
 
 ## TL;DR
 
-Extraction complète de l'historique **et** surveillance en temps réel des conversations Claude Desktop, par reverse engineering du stockage propriétaire Chromium/Blink/V8, puis découverte du cache HTTP Chromium (zstd) comme vecteur temps réel universel.
+Full extraction of conversation history and real-time monitoring, achieved by reverse-engineering Chromium/Blink/V8 proprietary storage formats — and then discovering that the Chromium HTTP cache was the better solution all along.
 
 ---
 
-## Contexte
+## Context
 
-Claude Desktop (Electron) stocke les conversations localement dans une IndexedDB Chromium. Aucune documentation publique sur le format exact. L'objectif : lire ces données programmatiquement pour construire **Mnemos**, un système de mémoire persistante pour Claude via MCP.
-
----
-
-## Les tentatives qui ont échoué
-
-### Tentative 1 — LevelDB.NET direct
-Lecture de la base LevelDB en C# avec le wrapper existant.
-
-**Résultat :** `Corruption: corrupted compressed block contents`
-
-**Cause :** Le wrapper C# ne gère pas l'implémentation Snappy de Chromium (flags de compilation différents).
-
-### Tentative 2 — Scraping binaire brute force
-Lecture des fichiers `.blob` en `byte[]`, extraction des séquences ASCII/UTF-8 avec Regex.
-
-**Résultat :** Texte fragmenté, phrases coupées au milieu, inutilisable.
-
-**Cause :** Les pointeurs de compression Snappy et les marqueurs V8 coupent les strings.
-
-### Tentative 3 — ccl_chromium_reader (Python)
-Utilisation de la lib spécialisée CCL pour décoder Snappy + V8.
-
-**Résultat :** `RecursionError` sur la clé `react-query-cache`.
-
-**Cause :** Références circulaires dans l'objet V8, non gérées par CCL.
-
-### Tentative 4 — v8.deserialize() Node.js natif
-Tentative de désérialisation directe avec le vrai moteur V8 de Node.js.
-
-**Résultat :** `Unable to deserialize cloned data due to invalid or unsupported version`
-
-**Cause :** Host objects Blink (`0x5C`) dans le stream V8 — Node n'a pas le delegate Blink pour les gérer.
+Claude Desktop is built on Electron. It stores conversations locally in a Chromium IndexedDB. There is no public documentation on the format. The goal was to read that data programmatically to build Mnemos — a persistent memory layer for Claude via MCP.
 
 ---
 
-## La vraie structure du fichier blob
+## What didn't work
 
-### Étape 1 — Identifier la compression
+Before finding the right path, four approaches failed in a row.
 
-Inspection des premiers bytes du fichier blob (`2cb0`, 2.17MB) :
+**LevelDB.NET** — the first instinct was to read the underlying LevelDB database directly using a C# wrapper. It returned `Corruption: corrupted compressed block contents` immediately. Chromium uses a custom Snappy build with different compilation flags than the one the wrapper expects.
+
+**Brute force binary scraping** — reading `.blob` files as raw bytes and extracting UTF-8 sequences with Regex. Output was fragmented text with sentences cut in half. Snappy compression pointers and V8 markers split strings at arbitrary offsets.
+
+**ccl_chromium_reader** — a Python library specifically built for this kind of work. Crashed with a `RecursionError` on the `react-query-cache` key. The library doesn't handle circular V8 object references.
+
+**Native `v8.deserialize()` in Node.js** — the most promising attempt. Failed with `Unable to deserialize cloned data due to invalid or unsupported version`. The V8 stream contains Blink host objects (`0x5C`) that Node's V8 engine doesn't know how to handle without the Blink delegate.
+
+---
+
+## Phase 1 — Cracking the blob format
+
+### Identifying the compression
+
+Inspecting the first bytes of a large blob file (`2cb0`, 2.17 MB):
 
 ```
 FF 11 02 C1 C8 D9 02 0C ...
 ```
 
-En lisant `idb_value_wrapping.cc` dans le source Chromium :
+Reading `idb_value_wrapping.cc` in the Chromium source gave the answer directly:
 
 ```cpp
-static const uint8_t kReplaceWithBlob = 1;
-static const uint8_t kCompressedWithSnappy = 2;
-
-wire_data_buffer_[0] = static_cast<uint8_t>(kVersionTag);  // 0xFF
-wire_data_buffer_[1] = kRequiresProcessingSSVPseudoVersion; // 0x11
-wire_data_buffer_[2] = kCompressedWithSnappy;               // 0x02
+wire_data_buffer_[0] = static_cast<uint8_t>(kVersionTag);   // 0xFF
+wire_data_buffer_[1] = kRequiresProcessingSSVPseudoVersion;  // 0x11
+wire_data_buffer_[2] = kCompressedWithSnappy;                // 0x02
 ```
 
-**Conclusion :** `FF 11 02` = header 3 bytes fixe. Ce qui suit = Snappy raw (sans framing).
+`FF 11 02` is a fixed 3-byte header. Everything after it is raw Snappy without framing.
 
-### Étape 2 — Décompression Snappy
+### Snappy decompression
 
 ```python
 import snappy
 data = open('2cb0', 'rb').read()
-decompressed = snappy.decompress(data[3:])  # skip FF 11 02
-# 2 171 261 bytes → 5 661 761 bytes décompressés
+decompressed = snappy.decompress(data[3:])
+# 2,171,261 bytes → 5,661,761 bytes
 ```
 
-### Étape 3 — Identifier le wrapper Blink
+### The Blink wrapper
 
-Premiers bytes après décompression :
+First bytes after decompression:
 
 ```
-FF 15 FE 00 00 00 00 00 00 00 00 00 00 00 00 FF 0F 6F 22 06 62 75 73 74 65 72
+FF 15 FE 00 00 00 00 00 00 00 00 00 00 00 00 FF 0F 6F ...
 ```
 
-Décodage :
 - `FF 15` → Blink version 21
-- `FE 00 00 ... (x13)` → table des blobs externes (13 bytes de padding)
-- `FF 0F` → V8 version 15 ← début du vrai stream V8
+- `FE 00 00 ... (×13)` → external blobs table (13 bytes of padding)
+- `FF 0F` → V8 version 15 — the actual V8 stream starts here
 
-**Offset exact : 15 bytes** à skipper après décompression.
+That's a fixed 15-byte offset. Confirmed empirically by bruteforcing offsets 0 through 30 and checking which one `v8.deserialize()` accepted.
 
-Confirmé empiriquement en testant tous les offsets 0 à 30 avec `v8.deserialize()` — succès uniquement à offset 15.
+### What comes out
 
-### Étape 4 — Lire le stream V8
-
-Après décompression + skip 15 bytes, `v8.deserialize()` Node.js retourne :
+After decompression and skipping the 15-byte Blink prefix:
 
 ```json
 {
-   "buster": "conversations_v2",
-   "timestamp": 1776152190198,
-   "clientState": {
-      "mutations": [],
-      "queries": [...]
-   }
+  "buster": "conversations_v2",
+  "timestamp": 1776152190198,
+  "clientState": {
+    "mutations": [],
+    "queries": [...]
+  }
 }
 ```
 
-### Étape 5 — Trouver les conversations
+Conversations live in `clientState.queries`, filtered by `queryKey[0] == "chat_conversation_tree"`. Each entry contains the full conversation tree, including thinking blocks, timestamps, and parent-child message relationships.
 
-12 queries dans `clientState.queries`. Les conversations sont dans les queries avec `queryKey[0] == "chat_conversation_tree"` :
+### The V8 deserializer
 
-```json
-{
-   "queryKey": ["chat_conversation_tree", {"orgUuid": "..."}, {"uuid": "..."}],
-   "state": {
-      "data": {
-         "uuid": "788f3d8f-...",
-         "name": "Obsidian et Claude Desktop : mythe ou réalité",
-         "chat_messages": [...]
-      }
-   }
-}
-```
+Since neither Node nor any existing C# library could handle the stream cleanly, the only option was to write a deserializer from scratch. The opcodes encountered in real data:
 
-### Structure d'un message
+| Opcode | Description |
+|---|---|
+| `0xFF` | Version header |
+| `0x54 / 0x46` | `true` / `false` |
+| `0x49` | int32 ZigZag encoded |
+| `0x55` | uint32 |
+| `0x4E` | double (8 bytes LE) |
+| `0x22` | string Latin-1 |
+| `0x63` | string UTF-16LE |
+| `0x6F` | begin object |
+| `0x7B` | end object |
+| `0x41` | dense array |
+| `0x5E` | object reference |
+| `0x5C` | Blink host object (skipped) |
 
-```json
-{
-   "uuid": "019d7e79-...",
-   "sender": "assistant",
-   "content": [
-      {
-         "type": "thinking",
-         "thinking": "The user is asking about..."
-      },
-      {
-         "type": "text",
-         "text": "Oui c'est réel, mais y'a du marketing dedans..."
-      }
-   ],
-   "created_at": "2026-04-11T21:36:54.934520Z",
-   "parent_message_uuid": "019d7e79-..."
-}
-```
+**Result:** 18,960 lines of conversations extracted cleanly, thinking blocks included.
 
 ---
 
-## Pipeline final
+## Phase 2 — The real-time problem
 
-```
-fichier .blob
-  └── [0:3]   FF 11 02          → header Snappy (3 bytes fixe)
-  └── [3:]    données compressées
-      └── Snappy.Decompress()
-          └── [0:15]  wrapper Blink (skip)
-          └── [15:]   V8 SSV pur
-              └── V8Deserializer.Deserialize()
-                  └── clientState.queries[]
-                      └── queryKey[0] == "chat_conversation_tree"
-                          └── state.data.chat_messages[]
-                              └── sender + content[].text + thinking
-```
+### The limitation
 
----
+Blobs only exist for large conversations (>64 KB). Short sessions never cross the threshold — they stay in RAM and never get flushed to disk. The blob approach worked well for history, but was useless for the main Mnemos use case: continuity across short sessions.
 
-## Implémentation C#
+### Watching everything
 
-### SnappyDecompressor.cs
-
-Détection du header `FF 11 02`, décompression Snappy (NuGet Snappier), skip 15 bytes Blink.
-
-### V8Deserializer.cs
-
-Désérialiseur V8 from scratch. Opcodes implémentés confirmés sur les données réelles :
-
-| Opcode | Tag | Description |
-|--------|-----|-------------|
-| `0xFF` | kVersion | Header version, skip |
-| `0x54` | `T` | true |
-| `0x46` | `F` | false |
-| `0x30` | `0` | null |
-| `0x49` | `I` | int32 zigzag encoded |
-| `0x55` | `U` | uint32 |
-| `0x4E` | `N` | double (8 bytes LE) |
-| `0x22` | `"` | string Latin-1 |
-| `0x63` | `c` | string UTF-16LE |
-| `0x6F` | `o` | begin object |
-| `0x7B` | `{` | end object |
-| `0x41` | `A` | dense array |
-| `0x24` | `$` | end dense array |
-| `0x61` | `a` | sparse array |
-| `0x44` | `D` | Date |
-| `0x5E` | `^` | object reference |
-| `0x5C` | `\` | host object Blink (skip) |
-
-### ConversationExtractor.cs
-
-Navigation dans l'arbre d'objets désérialisés, extraction des `chat_conversation_tree` queries, reconstruction des conversations et messages.
-
----
-
-## Résultats
-
-- **18 960 lignes** de conversations extraites proprement
-- **Thinking blocks** inclus (raisonnement interne de Claude)
-- **Timestamps** précis à la microseconde
-- **Arbre de conversation** préservé via `parent_message_uuid`
-- Fonctionne sur tous les blobs `00` → `2c`
-
----
-
-## Ce qui est remarquable
-
-La plupart des projets similaires s'arrêtent à l'étape 1 ou utilisent des outils existants (ccl_chromium_reader, dfindexeddb). Ici :
-
-- Lecture directe de `idb_value_wrapping.cc` source Chromium pour identifier le header Snappy
-- Identification empirique de l'offset Blink (15 bytes) par bruteforce d'offsets
-- Désérialiseur V8 écrit from scratch en C# sans référence directe au code V8
-- Zéro dépendance tierce pour le parsing (juste Snappier pour Snappy)
-
----
-
-## Stack technique
-
-- **C# / .NET 9**
-- **Snappier** (NuGet) — décompression Snappy
-- **Sources Chromium** — reverse engineering du format
-- **Python + node-snappy** — phase d'investigation
-
----
-
----
-
-## Phase 2 — Le problème du temps réel
-
-### Constat après la phase 1
-
-Les blobs ne couvrent que les grandes conversations (>64KB). Les petites convos — une session d'apprentissage du japonais, une session courte de travail — ne dépassent jamais le seuil et restent en RAM. Le `--sync` est inutile pour le use case principal de Mnemos : la continuité entre sessions courtes.
-
-### Investigation systématique de tous les dossiers
-
-Surveillance de **tout** `AppData\Roaming\Claude` en temps réel pendant l'envoi d'un message, script Python qui détecte chaque fichier qui change :
+The approach was simple: monitor the entire `AppData\Roaming\Claude` directory in real-time and log every file that changed while sending a message.
 
 ```
 [CHANGE]  \sentry\scope_v3.json
 [CHANGE]  \logs\claude.ai-web.log
-[CHANGE]  \Session Storage\000055.log
-[NOUVEAU] \Cache\Cache_Data\f_0003d9 — 275556 bytes  ← 
+[NEW]     \Cache\Cache_Data\f_0003d9  (275,556 bytes)
 [CHANGE]  \Local Storage\leveldb\004581.log
-[CHANGE]  \DIPS-wal
-[NOUVEAU] \Cache\Cache_Data\f_0003da — 274931 bytes  ←
+[NEW]     \Cache\Cache_Data\f_0003da  (274,931 bytes)
 ```
 
-**Deux nouveaux fichiers créés dans `Cache\Cache_Data`** à chaque échange.
+Two new files in `Cache\Cache_Data` on every single prompt/response cycle.
 
-### Dossiers inspectés et résultats
+What every other folder contained:
 
-| Dossier | Contenu | Utile |
-|---------|---------|-------|
-| `IndexedDB/.../leveldb` | Drafts en JSON, ne change pas pendant streaming | ❌ temps réel |
-| `IndexedDB/.../blob` | Grandes convos V8+Snappy | ✅ historique |
-| `Local Storage/leveldb` | Rien d'utile pour messages | ❌ |
-| `Session Storage/leveldb` | UUIDs + timestamps par conv | ⚠️ signal seulement |
-| `logs/` | Erreurs Electron/React | ❌ |
-| `shared_proto_db` | Quasi vide | ❌ |
-| `WebStorage` | QuotaManager SQLite | ❌ |
-| `fcache` | Feature flags gzippés (Growthbook) | ❌ |
-| `ant-did` | Device ID base64 | ❌ |
-| `sentry/scope_v3.json` | Log réseau complet de session | ℹ️ |
-| `Cache/Cache_Data/f_*` | **Cache HTTP Chromium zstd** | ✅✅ temps réel |
-
-### Session Storage — signal temps réel
-
-`Session Storage/000052.log` contient des clés du type :
-```
-map-183-messages_last_timestamp_959dc6fa-8b8f-49ea-ab89-dfa0c2cd5e91
-```
-
-Ce fichier est mis à jour instantanément à chaque message. Confirmé :
-```
-Taille initiale: 52411
-CHANGEMENT: 52411 → 52698   ← message envoyé
-CHANGEMENT: 52698 → 52814   ← réponse reçue
-```
-
-Les valeurs sont des timestamps Unix en millisecondes encodés UTF-16LE. C'est le signal, pas le contenu.
+| Folder | Contents |
+|---|---|
+| `IndexedDB/.../blob` | Large conversations, V8+Snappy — good for history |
+| `IndexedDB/.../leveldb` | Drafts in JSON, doesn't update during streaming |
+| `Session Storage/leveldb` | UUIDs and timestamps per conversation — signal only |
+| `Local Storage/leveldb` | Nothing useful for messages |
+| `Cache/Cache_Data/f_*` | **Full HTTP responses, zstd-compressed — the real thing** |
 
 ---
 
-## Phase 3 — Le cache HTTP Chromium : la vraie solution
+## Phase 3 — The HTTP cache
 
-### Découverte
+### The discovery
 
-Les fichiers `Cache/Cache_Data/f_*` créés pendant chaque échange ont le magic number **Zstandard** :
-
-```
-28 B5 2F FD ...
-```
-
-Ce sont les réponses HTTP cachées par Chromium, compressées en zstd.
-
-### Décompression
+The `f_*` files open with `28 B5 2F FD` — the Zstandard magic bytes. Chromium is caching the full HTTP response from Claude's API, compressed in zstd.
 
 ```python
 import zstandard as zstd
-
 with open('f_0003e1', 'rb') as f:
     data = f.read()
-
-dctx = zstd.ZstdDecompressor()
-decompressed = dctx.decompress(data, max_output_size=10_000_000)
-# 868 685 bytes de JSON propre
+decompressed = zstd.ZstdDecompressor().decompress(data, max_output_size=10_000_000)
+# 868,685 bytes of clean JSON
 ```
 
-### Résultat
+Output:
 
 ```json
 {
-  "uuid": "959dc6fa-8b8f-49ea-ab89-dfa0c2cd5e91",
+  "uuid": "959dc6fa-...",
   "name": "Vérifier le texte avant d'ajouter le regex",
   "chat_messages": [
-    {
-      "sender": "human",
-      "content": [{"type": "text", "text": "azy test"}]
-    },
-    {
-      "sender": "assistant", 
-      "content": [{"type": "text", "text": "Colle le résultat."}]
-    }
+    { "sender": "human", "content": [{ "type": "text", "text": "azy test" }] },
+    { "sender": "assistant", "content": [{ "type": "text", "text": "Colle le résultat." }] }
   ]
 }
 ```
 
-**JSON complet, propre, avec tous les messages — petites et grandes convos.**
+Clean JSON, every message, every conversation — with no size threshold.
 
-### Pourquoi c'est la vraie solution
+### Why this is the better solution
 
-- Fonctionne pour **toutes** les convos sans exception (pas de seuil de taille)
-- Pas d'API externe, pas de Cloudflare, pas de CDP
-- Fichier local, lecture directe
-- Mise à jour à chaque échange
-- Contient les thinking blocks, timestamps, tout
+The HTTP cache makes the blob deserializer look like archaeology. No size threshold, no complex V8 parsing, no Blink offsets. Every conversation, every time, as clean JSON, available the moment a response arrives.
 
-### Pipeline temps réel final
+The blob pipeline still matters for initial history sync. But for everything real-time, the cache wins.
+
+---
+
+## Final pipeline
 
 ```
-Cache/Cache_Data/f_*  nouveau fichier détecté (FileSystemWatcher)
-        ↓
-magic bytes 28 B5 2F FD  → zstd decompress
-        ↓
-JSON propre → chat_messages[]
-        ↓
-sender + content[].text + thinking
-        ↓
-SQLite (à venir)
+History sync
+  IndexedDB blob files
+    → strip FF 11 02 header
+    → Snappy decompress
+    → skip 15-byte Blink prefix
+    → V8 deserialize
+    → extract chat_conversation_tree queries
+    → messages + thinking blocks
+
+Real-time watch
+  Cache/Cache_Data/f_* (FileSystemWatcher)
+    → verify 28 B5 2F FD magic bytes
+    → zstd decompress
+    → parse JSON
+    → messages + thinking blocks
+
+Both pipelines feed into:
+  SQLite (FTS5 + vector BLOBs)
+    → ONNX embeddings (MiniLM-L6-v2)
+    → MCP server
 ```
 
 ---
 
-## Implémentation C# — CacheWatcher.cs
-
-Détection des nouveaux fichiers `f_*` via `FileSystemWatcher`, vérification du magic zstd `28 B5 2F FD`, décompression via `ZstdSharp.Port` (NuGet), parsing JSON via `System.Text.Json`.
-
----
-
-## Stack technique finale
+## Stack
 
 - **C# / .NET 9**
-- **Snappier** (NuGet) — décompression Snappy (blobs)
-- **ZstdSharp.Port** (NuGet) — décompression zstd (cache HTTP)
-- **System.Text.Json** — parsing JSON natif
-- **Sources Chromium** — reverse engineering du format blob
-- **Python + zstandard** — phase d'investigation cache
-
----
-
-## Résultats finaux
-
-- **`--sync`** : extrait l'historique complet depuis les blobs IndexedDB
-- **`--watch`** : surveillance temps réel via le cache HTTP Chromium, toutes convos
-- Mnemos lit ses propres conversations en temps réel — confirmé en direct
-
----
-
-## Prochaines étapes
-
-- [ ] SQLite — stockage persistant des conversations
-- [ ] FTS5 — full text search sur les messages
-- [ ] Déduplication — éviter les doublons entre blobs et cache
-- [ ] MCP server — exposition via Model Context Protocol (`search_memory`, `get_context`)
-- [ ] summaries — c'est la vraie valeur ajoutée long terme. Le problème des mémoires c'est exactement ça — injecter 150 messages dans le contexte c'est inutilisable. Mais c'est une feature à part, pas juste du schema. À garder pour plus tard.
-- [ ] metadata JSON — bonne idée pour la flexibilité. Évite l'explosion de tables. Garder.
+- **Snappier** — Snappy decompression (blobs)
+- **ZstdSharp.Port** — Zstandard decompression (HTTP cache)
+- **System.Text.Json** — JSON parsing
+- **Python + node-snappy + zstandard** — investigation phase
+- **Chromium source** (`idb_value_wrapping.cc`) — format reference
