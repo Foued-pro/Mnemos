@@ -11,7 +11,7 @@ public class BlobWatcher : IDisposable
     private readonly SemaphoreSlim _signal = new(0);
     private readonly ConcurrentDictionary<string, long> _seen = new();
     
-    // On ajoute un "pointeur" vers ta super fonction de décodage V8 !
+    // Injected delegate for V8 deserialization to avoid tight coupling
     private readonly Func<string, List<Conversation>> _processBlobFunc; 
 
     public BlobWatcher(string blobRoot, Func<string, List<Conversation>> processBlobFunc)
@@ -19,7 +19,7 @@ public class BlobWatcher : IDisposable
         _blobRoot = blobRoot;
         _processBlobFunc = processBlobFunc;
         
-        // Index les fichiers existants au démarrage
+        // Index existing files to prevent reprocessing on startup
         foreach (var f in Directory.GetFiles(blobRoot, "*", SearchOption.AllDirectories))
         {
             try { _seen[f] = new FileInfo(f).Length; } catch { }
@@ -46,29 +46,28 @@ public class BlobWatcher : IDisposable
     {
         while (!ct.IsCancellationRequested)
         {
-            // Attend un signal ou timeout (polling de secours)
+            // Wait for FS events with a 2-second polling fallback
             await _signal.WaitAsync(TimeSpan.FromSeconds(2), ct);
             
-            // Scan tous les fichiers pour trouver les nouveaux/modifiés
             foreach (var path in Directory.GetFiles(_blobRoot, "*", SearchOption.AllDirectories))
             {
                 FileInfo fi;
                 try { fi = new FileInfo(path); }
                 catch { continue; }
                 
-                // Skip si déjà vu avec même taille
+                // Skip if file hasn't grown/changed
                 if (_seen.TryGetValue(path, out long lastSize) && lastSize == fi.Length)
                     continue;
                 
-                // Skip les petits fichiers
+                // Ignore temporary/empty Chromium blobs
                 if (fi.Length < 500) continue;
                 
                 _seen[path] = fi.Length;
                 
-                // Laisse le temps à Chrome d'écrire le fichier sur le disque
+                // Give Chromium time to flush the file stream to disk
                 await Task.Delay(200, ct);
 
-                // MAGIE : On utilise ton V8Deserializer ici !
+                // Process the binary blob
                 List<Conversation> convs = _processBlobFunc(path);
                 
                 if (convs != null && convs.Count > 0)

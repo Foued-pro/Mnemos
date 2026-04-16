@@ -1,268 +1,174 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Mnemos.Database;
 using Mnemos.Models;
-using Mnemos.Search;
 using Mnemos.Mcp;
-using Microsoft.Extensions.Logging; 
+using Mnemos.Core;
+using System.Collections.Generic;
+using System.Linq;
+
 namespace Mnemos;
 
 class Program
 {
-    private static readonly string BlobRoot = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        @"Claude\IndexedDB\https_claude.ai_0.indexeddb.blob\1"
-    );
+    // Centralize AppData path for cleaner path building
+    private static readonly string AppData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
 
-    private static readonly string CacheDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        @"Claude\Cache\Cache_Data"
-    );
-
-    private static readonly string OutputFile = "conversations.txt";
+    private static readonly string BlobRoot = Path.Combine(AppData, @"Claude\IndexedDB\https_claude.ai_0.indexeddb.blob\1");
+    private static readonly string CacheDir = Path.Combine(AppData, @"Claude\Cache\Cache_Data");
+    private static readonly string ModelDir = Path.Combine(AppData, @"Claude\Models\minilm");
+    private static readonly string LogFile = Path.Combine(AppData, @"Claude\mnemos.log");
     
-    private static readonly MnemosDb Db = new(
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"Claude\mnemos.db")
-    );
+    private static readonly MnemosDb Db = new(Path.Combine(AppData, @"Claude\mnemos.db"));
+    private static EmbeddingEngine? _embedder;
 
+    // ── LOGGING ───────────────────────────────────────────────────────────
+    static void Log(string message, string level = "INFO")
+    {
+        string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}";
+        Console.Error.WriteLine(line); // Outputs to Claude Desktop console
+        try { File.AppendAllText(LogFile, line + "\n"); } catch { } // Appends to PowerShell log
+    }
+
+    // ── MAIN (MCP DAEMON) ─────────────────────────────────────────────────
     static async Task Main(string[] args)
     {
-        // === MODE MCP (Model Context Protocol) - DOIT ÊTRE EN PREMIER ===
-        if (args.Contains("--mcp"))
-        {
-            McpTools.Init(Db);
-            var builder = Host.CreateApplicationBuilder(args);
-            builder.Logging.ClearProviders(); // ← supprime les logs stdout
-            builder.Services.AddMcpServer()
-                .WithStdioServerTransport()
-                .WithToolsFromAssembly();
-            await builder.Build().RunAsync();
-            return;
-        }
+        Log("Mnemos v4.0 starting...");
 
-        // === Mode normal (console interactive) ===
-        Console.Clear();
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("╔══════════════════════════════════════╗");
-        Console.WriteLine("║         MNEMOS v4.0 - MOTEUR         ║");
-        Console.WriteLine("╚══════════════════════════════════════╝\n");
-        Console.ResetColor();
-
-        // === AUTO-SYNC si la base est vide ===
-        var (existingConvs, existingMsgs) = Db.GetStats();
-        if (existingMsgs == 0)
+        //  Database Initialization & Initial Sync
+        var (_, mcpMsgs) = Db.GetStats();
+        if (mcpMsgs == 0)
         {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine("[AUTO-SYNC] Base vide, extraction initiale automatique...\n");
-            Console.ResetColor();
+            Log("Empty database detected. Starting initial sync...");
             SyncAll();
         }
 
-        // Gestion des arguments ou menu interactif
-        if (args.Contains("--sync"))
+        // Semantic Engine Initialization (ONNX)
+        if (Directory.Exists(ModelDir))
         {
-            SyncAll();
+            try
+            {
+                _embedder = new EmbeddingEngine(ModelDir);
+                Log("[ONNX] Semantic engine initialized.");
+            }
+            catch (Exception ex)
+            {
+                Log($"[ONNX] Initialization error: {ex.Message}", "ERROR");
+            }
         }
-        else if (args.Contains("--watch"))
-        {
-            await WatchAsync();
-        }
-        else
-        {
-            Console.WriteLine("Choisir un mode :");
-            Console.WriteLine("  [1] Extraire tout l'historique");
-            Console.WriteLine("  [2] Voir les conversations en temps réel");
-            Console.WriteLine("  [3] Rechercher dans la mémoire");
-            Console.Write("\nChoix : ");
 
-            string? choice = Console.ReadLine();
-            if (choice == "1") SyncAll();
-            else if (choice == "2") await WatchAsync();
-            else if (choice == "3") SearchHandler.Run(Db);
-            else Console.WriteLine("Choix invalide.");
+        // Initialize MCP Tools
+        McpTools.Init(Db, _embedder);
+
+        // Scheduled Embedding Generator
+        if (_embedder != null)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        var msgs = Db.GetMessagesWithoutEmbedding(500);
+                        if (msgs.Count == 0)
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(5));
+                            continue;
+                        }
+
+                        foreach (var (uuid, text) in msgs)
+                        {
+                            try { Db.SaveEmbeddings(uuid, _embedder.GenerateEmbeddings(text)); }
+                            catch { /* Ignore local embedding errors to keep the loop alive */ }
+                        }
+                        await Task.Delay(1000);
+                    }
+                }
+                catch (Exception ex) { Log($"[ONNX] Thread crashed: {ex.Message}", "ERROR"); }
+            });
         }
+
+        // Real-time Cache Watcher
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var watcher = new CacheWatcher(CacheDir);
+                await foreach (var convs in watcher.WatchAsync(CancellationToken.None))
+                {
+                    Db.SaveConversations(convs);
+
+                    // Immediate vectorization for real-time messages
+                    if (_embedder != null)
+                    {
+                        var newMsgs = Db.GetMessagesWithoutEmbedding(50);
+                        foreach (var (uuid, text) in newMsgs)
+                        {
+                            Db.SaveEmbeddings(uuid, _embedder.GenerateEmbeddings(text));
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Log($"[WATCH] Thread crashed: {ex.Message}", "ERROR"); }
+        });
+
+        // Start MCP Stdio Server 
+        var builder = Host.CreateApplicationBuilder(args);
+        
+        // Mute default ASP.NET logs to prevent JSON-RPC corruption over Stdio
+        builder.Logging.ClearProviders(); 
+        builder.Services.AddMcpServer().WithStdioServerTransport().WithToolsFromAssembly();
+        
+        Log("MCP Server running on Stdio.");
+        await builder.Build().RunAsync();
     }
 
     // ── SYNC ──────────────────────────────────────────────────────────────
     static void SyncAll()
     {
-        Console.WriteLine("[SYNC] Extraction de tout l'historique...\n");
+        Log("[SYNC] Extracting history...");
         var allConversations = new List<Conversation>();
 
-        // 1. Blobs
-        Console.WriteLine("--- BLOBS ---");
+        // Extract from IndexedDB (Historical data)
         if (Directory.Exists(BlobRoot))
         {
             foreach (var dir in Directory.GetDirectories(BlobRoot).OrderBy(d => d))
-            {
                 foreach (var blobPath in Directory.GetFiles(dir))
-                {
-                    var convs = ProcessBlob(blobPath);
-                    if (convs.Count > 0)
-                    {
-                        allConversations.AddRange(convs);
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.WriteLine($"[+] {Path.GetFileName(dir)} → {convs.Count} conv(s)");
-                        Console.ResetColor();
-                    }
-                }
-            }
+                    allConversations.AddRange(ProcessBlob(blobPath));
         }
 
-        // 2. Cache Chromium
-        Console.WriteLine("\n--- CACHE CHROMIUM ---");
+        // Extract from Cache (Recent data)
         if (Directory.Exists(CacheDir))
         {
             var seen = new HashSet<string>();
-            foreach (var path in Directory.GetFiles(CacheDir, "f_*")
-                         .OrderByDescending(f => new FileInfo(f).LastWriteTime))
+            foreach (var path in Directory.GetFiles(CacheDir, "f_*").OrderByDescending(f => new FileInfo(f).LastWriteTime))
             {
-                var convs = CacheWatcher.TryParseCache(path);
-                foreach (var conv in convs)
+                foreach (var conv in CacheWatcher.TryParseCache(path))
                 {
                     if (seen.Contains(conv.Uuid)) continue;
                     seen.Add(conv.Uuid);
                     allConversations.Add(conv);
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"[+] Cache → {conv.Name} ({conv.Messages.Count} messages)");
-                    Console.ResetColor();
                 }
             }
         }
-
-        Console.WriteLine($"\n[i] Total : {allConversations.Count} conversations extraites");
 
         if (allConversations.Count > 0)
         {
             Db.SaveConversations(allConversations);
-            var (convs, msgs) = Db.GetStats();
-            Console.WriteLine($"[DB] {convs} conversations, {msgs} messages en base");
-
-            WriteToFile(allConversations);
-            Console.WriteLine($"[i] Sauvegardé dans {OutputFile}");
+            Log($"[SYNC] {allConversations.Count} conversations loaded into DB.");
         }
     }
 
-    // ── WATCH ─────────────────────────────────────────────────────────────
-    static async Task WatchAsync()
-    {
-        Console.WriteLine("[WATCH] En écoute... (Ctrl+C pour arrêter)\n");
-
-        using var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
-
-        var seenMessages = new HashSet<string>();
-
-        var cacheTask = Task.Run(async () =>
-        {
-            try
-            {
-                using var watcher = new CacheWatcher(CacheDir);
-                await foreach (var convs in watcher.WatchAsync(cts.Token))
-                {
-                    foreach (var conv in convs)
-                    {
-                        Db.SaveConversations([conv]);
-
-                        var (c, m) = Db.GetStats();
-                        Console.ForegroundColor = ConsoleColor.DarkGray;
-                        Console.WriteLine($"[DB] {c} convs, {m} msgs");
-                        Console.ResetColor();
-
-                        Console.ForegroundColor = ConsoleColor.Cyan;
-                        Console.WriteLine($"\n╔══ {conv.Name}");
-                        Console.ResetColor();
-
-                        foreach (var msg in conv.Messages)
-                        {
-                            if (seenMessages.Contains(msg.Uuid)) continue;
-                            seenMessages.Add(msg.Uuid);
-                            PrintMessage(msg);
-                        }
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception ex)
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[ERR] {ex.Message}");
-                Console.ResetColor();
-            }
-        });
-
-        try 
-        { 
-            await cacheTask; 
-        }
-        catch (OperationCanceledException)
-        {
-            Console.WriteLine("\n[i] Arrêté.");
-        }
-    }
-
-    // ── HELPERS ───────────────────────────────────────────────────────────
     static List<Conversation> ProcessBlob(string path)
     {
         try
         {
             byte[]? v8Data = SnappyDecompressor.Decompress(path);
             if (v8Data == null) return [];
-
             var deserializer = new V8Deserializer(v8Data);
-            object? root = deserializer.Deserialize();
-            return ConversationExtractor.Extract(root);
+            return ConversationExtractor.Extract(deserializer.Deserialize());
         }
-        catch 
-        { 
-            return []; 
-        }
-    }
-
-    static void PrintMessage(ChatMessage msg)
-    {
-        if (string.IsNullOrEmpty(msg.Text) && msg.Thinking == null) return;
-
-        Console.ForegroundColor = msg.Sender == "human"
-            ? ConsoleColor.White
-            : ConsoleColor.Green;
-
-        string time = msg.CreatedAt.Length >= 19 ? msg.CreatedAt[..19] : msg.CreatedAt;
-        Console.WriteLine($"\n[{msg.Sender.ToUpper()}] {time}");
-        Console.ResetColor();
-
-        if (!string.IsNullOrEmpty(msg.Text))
-            Console.WriteLine(msg.Text.Length > 500
-                ? msg.Text[..500] + "..."
-                : msg.Text);
-
-        if (msg.Thinking != null)
-        {
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"[thinking] {msg.Thinking[..Math.Min(80, msg.Thinking.Length)]}...");
-            Console.ResetColor();
-        }
-    }
-
-    static void WriteToFile(List<Conversation> conversations)
-    {
-        using var writer = new StreamWriter(OutputFile, false);
-        foreach (var conv in conversations.OrderBy(c => c.CreatedAt))
-        {
-            writer.WriteLine(new string('=', 60));
-            writer.WriteLine($"CONVERSATION : {conv.Name}");
-            writer.WriteLine($"UUID         : {conv.Uuid}");
-            writer.WriteLine($"DATE         : {conv.CreatedAt}");
-            writer.WriteLine(new string('=', 60));
-
-            foreach (var msg in conv.Messages)
-            {
-                writer.WriteLine($"\n[{msg.Sender.ToUpper()}] {msg.CreatedAt}");
-                writer.WriteLine(msg.Text);
-                if (msg.Thinking != null)
-                    writer.WriteLine($"[THINKING] {msg.Thinking}");
-            }
-            writer.WriteLine();
-        }
+        catch { return []; }
     }
 }

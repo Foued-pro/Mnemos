@@ -23,107 +23,106 @@ public class V8Deserializer
             byte tag = _data[_pos++];
             switch (tag)
             {
-                case 0xFF: ReadVarint(); continue;   // version header, skip
-                case 0x00: continue;                 // padding
-                case 0x3F: ReadVarint(); continue;   // verify object count, skip
+                // Control tags
+                case 0xFF: ReadVarint(); continue; // Version header
+                case 0x00: continue;               // Padding
+                case 0x3F: ReadVarint(); continue; // Object reference / padding
 
-                case 0x54: return true;              // 'T' true
-                case 0x46: return false;             // 'F' false
-                case 0x30: return null;              // '0' null
-                case 0x5F: return null;              // '_' undefined
-                case 0x2D: return null;              // '-' hole
+                // Primitives
+                case 0x54: return true;            // 'T'
+                case 0x46: return false;           // 'F'
+                case 0x30: return null;            // '0' (The Hole)
+                case 0x5F: return null;            // '_' (Undefined)
+                case 0x2D: return null;            // '-' (Null)
 
-                case 0x49:                           // 'I' int32 zigzag
+                case 0x49:                         // 'I' (Int32 ZigZag)
                 {
                     uint z = ReadVarint();
-                    return (int)((z >> 1) ^ -(z & 1));
+                    return (int)((z >> 1) ^ -(int)(z & 1));
                 }
 
-                case 0x55: return ReadVarint();      // 'U' uint32
+                case 0x55: return ReadVarint();    // 'U' (Uint32)
 
-                case 0x4E:                           // 'N' double (8 bytes LE)
+                case 0x4E:                         // 'N' (Double)
                 {
-                    double d = BitConverter.ToDouble(_data, _pos);
+                    if (_pos + 8 > _data.Length) return null;
+                    var d = BitConverter.ToDouble(_data, _pos);
                     _pos += 8;
                     return d;
                 }
 
-                case 0x22:                           // '"' one-byte string
+                case 0x22:                         // '"' (String Latin1)
                 {
                     int len = (int)ReadVarint();
-                    string s = Encoding.Latin1.GetString(_data, _pos, len);
+                    var s = Encoding.GetEncoding("ISO-8859-1").GetString(_data, _pos, len);
                     _pos += len;
                     return s;
                 }
 
-                case 0x63:                           // 'c' two-byte string (UTF-16LE)
+                case 0x63:                         // 'c' (String UTF-16)
                 {
                     int len = (int)ReadVarint();
-                    string s = Encoding.Unicode.GetString(_data, _pos, len);
+                    var s = Encoding.Unicode.GetString(_data, _pos, len);
                     _pos += len;
                     return s;
                 }
 
-                case 0x6F:                           // 'o' begin object
+                case 0x6F:                         // 'o' (Object)
                 {
                     var obj = new Dictionary<string, object?>();
                     _refs.Add(obj);
                     while (_pos < _data.Length && _data[_pos] != 0x7B)
                     {
-                        object? key = ReadValue();
-                        object? val = ReadValue();
-                        if (key is string k) obj[k] = val;
+                        if (ReadValue() is string key) obj[key] = ReadValue();
                     }
-                    _pos++;          // skip '{'
-                    ReadVarint();    // num_properties
+                    _pos++;
+                    ReadVarint(); 
                     return obj;
                 }
 
-                case 0x41:                           // 'A' dense array
+                case 0x41:                         // 'A' (Dense Array)
                 {
                     uint length = ReadVarint();
                     var arr = new List<object?>();
                     _refs.Add(arr);
                     for (uint i = 0; i < length; i++)
-                        arr.Add(_data[_pos] == 0x2D ? (object?)(_pos++ >= 0 ? null : null) : ReadValue());
-                    while (_pos < _data.Length && _data[_pos] != 0x24)
-                    { ReadValue(); ReadValue(); }    // extra properties
-                    _pos++;          // skip '$'
-                    ReadVarint();    // num_properties
-                    ReadVarint();    // length
+                    {
+                        if (_pos < _data.Length && _data[_pos] == 0x2D) { _pos++; arr.Add(null); }
+                        else arr.Add(ReadValue());
+                    }
+                    while (_pos < _data.Length && _data[_pos] != 0x24) { ReadValue(); ReadValue(); }
+                    _pos++; ReadVarint(); ReadVarint();
                     return arr;
                 }
 
-                case 0x61:                           // 'a' sparse array
+                case 0x61:                         // 'a' (Sparse Array)
                 {
-                    ReadVarint();    // length
+                    ReadVarint(); 
                     var arr = new List<object?>();
                     _refs.Add(arr);
                     while (_pos < _data.Length && _data[_pos] != 0x40)
-                    { ReadValue(); arr.Add(ReadValue()); }
-                    _pos++;          // skip '@'
+                    {
+                        ReadValue(); // index
+                        arr.Add(ReadValue());
+                    }
+                    _pos++; // Skip '@'
                     ReadVarint(); ReadVarint();
                     return arr;
                 }
 
-                case 0x44:                           // 'D' Date
+                case 0x44:                         // 'D' (Date)
                 {
-                    double ms = BitConverter.ToDouble(_data, _pos);
+                    var ms = BitConverter.ToDouble(_data, _pos);
                     _pos += 8;
                     return DateTimeOffset.FromUnixTimeMilliseconds((long)ms).ToString("o");
                 }
 
-                case 0x5E:                           // '^' object reference
-                {
-                    uint idx = ReadVarint();
-                    return idx < _refs.Count ? _refs[(int)idx] : null;
-                }
+                case 0x5E:                         // '^' (Back-reference)
+                    return _refs.ElementAtOrDefault((int)ReadVarint());
 
-                case 0x5C:                           // '\' host object (Blink) — on skip
-                    return null;
+                case 0x5C: return null;            // '\' (Host Object)
 
-                default:
-                    return null;                     // tag inconnu, on abandonne
+                default: return null;
             }
         }
         return null;

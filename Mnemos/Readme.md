@@ -1,71 +1,79 @@
 ﻿# Mnemos
 
-**Local persistent memory for Claude Desktop — 100% private, zero API calls.**
+Local persistent memory for Claude Desktop. 100% private, no API calls, hybrid RAG.
 
-Mnemos intercepts your Claude Desktop conversations in real time, indexes them in a local SQLite database with full-text search, and exposes a MCP server so Claude can search its own memory across sessions.
+> "Where were we on the sakugaa project?" — Claude can now search its own memory across past sessions.
 
-> "Where were we on the krino project?" — Claude can now answer that.
+---
+
+## The problem
+
+LLMs degrade as their context window fills up. Continuing a single conversation forever makes the model slower, more confused, and prone to hallucinations — a phenomenon sometimes called *context rot*.
+
+Mnemos solves this with selective memory: instead of stuffing 200k tokens into a single prompt, Claude can query only the relevant fragments from past sessions on demand, keeping active contexts clean and lightweight.
 
 ---
 
 ## How it works
 
-Claude Desktop stores conversations in a Chromium HTTP cache compressed with **Zstandard**. Mnemos watches for new cache files, decompresses them, extracts the messages, and stores them locally.
+Mnemos watches Claude Desktop's local storage in real-time, decompresses and deserializes conversation data, vectorizes it with a local ONNX model, and indexes everything into a local SQLite database. An MCP server then exposes search tools back to Claude.
 
 ```
-Claude Desktop conversation
-    ↓
-Cache/Cache_Data/f_* (zstd compressed)
-    ↓
-Mnemos CacheWatcher detects new file
-    ↓
-zstd decompress → JSON with full chat_messages[]
-    ↓
-SQLite + FTS5 index (local, private)
-    ↓
-MCP server → Claude calls search_memory()
+Claude Desktop (Chromium)
+    ├─ Active session ──> CacheWatcher  (Zstd decompression + JSON parsing)
+    └─ History ─────────> BlobWatcher  (Snappy decompression + V8 deserialization)
+                               │
+                               ▼
+              EmbeddingEngine (ONNX MiniLM-L6-v2)
+                               │
+                               ▼
+              SQLite  (FTS5 + vector BLOBs)
+                               │
+                               ▼
+              MCP Server  <── JSON-RPC over stdio ──>  Claude
 ```
 
-No API calls. No Anthropic servers. No cloud. Everything stays on your machine.
+Search uses **Reciprocal Rank Fusion** to merge semantic results (cosine similarity) with keyword results (BM25 via FTS5), giving better recall than either approach alone.
 
 ---
 
 ## Features
 
-- **Real-time capture** — every conversation is indexed as you talk
-- **Full-text search** — BM25 + time decay, finds relevant messages fast
-- **Thinking blocks** — Claude's internal reasoning is stored too
-- **MCP server** — Claude can search its own memory mid-conversation
-- **Deduplication** — UUID-based, no duplicate messages between sources
-- **Tiered memory** — recent messages (Tier 1) vs archived (Tier 3)
-- **Code block indexing** — trigram search on code snippets
+- **Hybrid search** — semantic + keyword, merged with RRF
+- **Local embeddings** — `MiniLM-L6-v2` via ONNX Runtime, CUDA-accelerated when available
+- **Real-time indexing** — OS file watchers + semaphore debouncing, zero polling overhead
+- **Thinking extraction** — Claude's internal reasoning blocks are indexed alongside regular turns
+- **Fully offline** — nothing leaves your machine
 
 ---
 
 ## The reverse engineering
 
-This project required reverse engineering Chromium's proprietary storage format from scratch:
+Claude Desktop exposes no history API. Getting to the conversation data required reverse-engineering several layers of Chromium's internal storage formats.
 
-| Layer | Discovery |
-|-------|-----------|
-| Compression | `FF 11 02` header = Snappy (found in `idb_value_wrapping.cc` Chromium source) |
-| Blink wrapper | 15 bytes to skip after decompression (found empirically) |
-| V8 serialization | Custom deserializer for V8 SSV opcodes (`0x6F`, `0x41`, `0x22`...) |
-| HTTP cache | `28 B5 2F FD` = Zstandard magic bytes in `Cache/Cache_Data/f_*` |
+| Layer | Finding |
+|---|---|
+| HTTP cache | `28 B5 2F FD` — Zstandard magic bytes in `Cache/Cache_Data/f_*` |
+| Compression | `FF 11 02` header — Snappy framed stream, identified via `idb_value_wrapping.cc` |
+| Blink wrapper | 15-byte internal metadata prefix, successfully stripped |
+| V8 serialization | Custom C# deserializer for SSV opcodes: `0x6F` objects, `0x49` ZigZag ints, `0x41` dense arrays |
 
 Full writeup: [MNEMOS_REVERSE.md](./MNEMOS_REVERSE.md)
 
 ---
 
+## Stack
+
+- **C# / .NET 9**
+- **SQLite** with FTS5 and trigram tokenizer
+- **Microsoft.ML.OnnxRuntime**
+- **ModelContextProtocol.Server** (official MCP C# SDK)
+
+---
+
 ## Installation
 
-### Prerequisites
-
-- Windows (Claude Desktop path is hardcoded for now)
-- .NET 9 SDK
-- Claude Desktop
-
-### Build
+**Prerequisites:** Windows, .NET 9 SDK, Claude Desktop
 
 ```bash
 git clone https://github.com/Foued-pro/mnemos
@@ -73,107 +81,38 @@ cd mnemos/Mnemos
 dotnet publish -c Release -r win-x64 --self-contained true
 ```
 
-### Configure Claude Desktop
-
-Add to `%APPDATA%\Claude\claude_desktop_config.json`:
+Add the server to `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "mnemos": {
-      "command": "C:\\path\\to\\publish\\Mnemos.exe",
-      "args": ["--mcp"]
+      "command": "C:\\path\\to\\publish\\Mnemos.exe"
     }
   }
 }
 ```
 
-Restart Claude Desktop.
+Restart Claude Desktop. On first launch, Mnemos will sync your full conversation history in the background.
 
 ---
 
-## Usage
-
-```
-Mnemos.exe          → interactive menu
-Mnemos.exe --sync   → extract all history to SQLite
-Mnemos.exe --watch  → real-time capture mode
-Mnemos.exe --mcp    → MCP server mode (used by Claude Desktop)
-```
-
-### MCP tools available to Claude
+## MCP tools
 
 | Tool | Description |
-|------|-------------|
-| `search_memory(query)` | BM25 + time decay search across all conversations |
-| `get_recent_messages(uuid, n)` | Last N messages from a specific conversation |
-| `get_stats()` | Number of conversations and messages indexed |
-
----
-
-## Database schema
-
-```sql
-conversations   — uuid, name, created_at, message_count
-messages        — uuid, sender, text, thinking, tier, importance, embedding
-code_blocks     — language, code (trigram FTS5 indexed)
-tool_calls      — name, arguments, result
-conversation_summaries — for future hierarchical summarization
-```
-
-Search is hybrid: **BM25 (FTS5) × 0.7 + time decay × 0.3 + importance bonus**
-
----
-
-## Architecture
-
-```
-Mnemos/
-├── Core/
-│   ├── SnappyDecompressor.cs   — FF 11 02 header + Snappy decompress
-│   ├── V8Deserializer.cs       — V8 SSV opcodes parser (from scratch)
-│   └── ConversationExtractor.cs
-├── Watchers/
-│   ├── CacheWatcher.cs         — zstd cache files watcher (real-time)
-│   └── BlobWatcher.cs          — IndexedDB blob watcher (history)
-├── Database/
-│   └── MnemosDb.cs             — SQLite + FTS5 + tiered memory
-├── Mcp/
-│   └── McpTools.cs             — MCP server tools
-├── Search/
-│   └── SearchHandler.cs        — CLI search mode
-├── Models/
-│   └── Models.cs
-└── Program.cs
-```
+|---|---|
+| `search_hybrid(query, limit)` | Hybrid semantic + keyword search across all indexed conversations |
+| `get_recent_messages(uuid, n)` | Fetch the last N messages from a specific thread |
+| `get_stats()` | Database health, indexing progress, and memory usage |
 
 ---
 
 ## Roadmap
 
-- [ ] macOS / Linux support
-- [ ] ONNX local embeddings (semantic search on RTX GPU)
-- [ ] Auto-summarization of old conversations
-- [ ] Multi-instance support
-- [ ] Web UI
-
----
-
-## Tech stack
-
-- **C# / .NET 9**
-- **SQLite** with FTS5 + trigram tokenizer
-- **Snappier** — Snappy decompression
-- **ZstdSharp.Port** — Zstandard decompression
-- **ModelContextProtocol** — official MCP C# SDK
-
----
-
-## Why this exists
-
-Claude has no memory between sessions. Every time you start a new conversation, it starts from zero. Mnemos fixes that — not by sending your data to a cloud service, but by reading what's already stored locally on your machine.
-
-Your conversations never leave your computer.
+- macOS / Linux path support
+- Auto-summarization of stale conversations
+- Multi-instance support
+- Web UI for browsing the database
 
 ---
 

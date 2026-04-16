@@ -2,6 +2,7 @@
 using System.Text.Json;
 using ModelContextProtocol.Server;
 using Mnemos.Database;
+using Mnemos.Core;
 
 namespace Mnemos.Mcp;
 
@@ -9,87 +10,108 @@ namespace Mnemos.Mcp;
 public static class McpTools
 {
     private static MnemosDb? _db;
+    private static EmbeddingEngine? _embedder;
 
-    public static void Init(MnemosDb db) => _db = db;
+    public static void Init(MnemosDb db, EmbeddingEngine? embedder = null)
+    {
+        _db = db;
+        _embedder = embedder;
+    }
 
     [McpServerTool, Description(
-         "ATTENTION : Ceci est une recherche FTS5 stricte (mots-clés exacts), PAS une recherche sémantique ! " +
-         "Pour trouver une information, tu DOIS obligatoirement utiliser l'opérateur OR avec de multiples synonymes, " +
-         "traductions et termes liés. " +
-         "Exemples: Au lieu de 'salle', cherche 'salle OR gym OR entrainement OR fitness'. " +
-         "Au lieu de 'code', cherche 'code OR script OR python OR c# OR bug'. " +
-         "Évite les mots trop courts qui pourraient créer de faux positifs (ex: évite 'pecs' qui matche 'specs').")]
-    public static string search_memory(
-        [Description("Le texte à rechercher dans l'historique des conversations")]
-        string query,
-        [Description("Nombre de résultats à retourner (défaut: 5)")]
-        int limit = 5)
+        "Outil de recherche hybride (FTS5 + Vecteurs sémantiques). " +
+        "Idéal pour retrouver des concepts, des idées ou des messages spécifiques " +
+        "même si les mots exacts diffèrent, grâce à la recherche par similarité cosinus.")]
+    public static string search_hybrid(
+        [Description("La requête en langage naturel (ex: 'études au japon', 'bug python')")] string query,
+        [Description("Nombre de résultats (défaut: 5)")] int limit = 5)
     {
-        if (_db == null) return "DB non initialisée.";
+        if (_db == null || _embedder == null) 
+            return "Système sémantique non initialisé. Vérifie les logs GPU/CPU.";
 
-        var results = _db.Search(query, limit);
+        // 1. Keyword Search (FTS5)  Sanitize input to prevent SQLite syntax errors
+        string safeQuery = System.Text.RegularExpressions.Regex.Replace(query, @"[^\w\s]", " ");
+        var keywordResults = _db.Search(safeQuery, 20);
 
-        if (results.Count == 0)
-            return $"Aucun résultat pour '{query}'.";
+        // 2. Semantic Search (Embeddings)  Use the first chunk for short queries
+        var queryVectors = _embedder.GenerateEmbeddings(query);
+        if (queryVectors.Count == 0) return "Requête trop courte ou invalide.";
+        
+        var queryEmb = queryVectors[0];
+        var semanticResults = _db.SearchByEmbedding(queryEmb, 25);
 
-        var output = new List<object>();
-        foreach (var r in results)
+        // 3. Reciprocal Rank Fusion (RRF) to combine keyword and semantic results
+        var rrfScores = new Dictionary<string, (double Score, SearchResult Data)>();
+        const double k = 60.0; // Standard RRF constant
+
+        // Process semantic results first
+        for (int i = 0; i < semanticResults.Count; i++)
         {
-            output.Add(new
-            {
-                sender    = r.Sender,
-                text      = r.Text,
-                date      = r.CreatedAt[..19],
-                relevance = Math.Round(r.Relevance, 3),
-                conv_id   = r.ConversationUuid
-            });
+            var r = semanticResults[i];
+            rrfScores[r.Uuid] = (1.0 / (k + i + 1), r);
         }
 
-        return JsonSerializer.Serialize(output, new JsonSerializerOptions
+        // Merge with keyword results
+        for (int i = 0; i < keywordResults.Count; i++)
         {
-            WriteIndented = true
-        });
-    }
-
-    [McpServerTool, Description(
-        "Retourne les derniers messages d'une conversation spécifique. " +
-        "Utile pour reprendre le contexte exact d'une session de travail.")]
-    public static string get_recent_messages(
-        [Description("L'UUID de la conversation")]
-        string conversation_uuid,
-        [Description("Nombre de messages à retourner (défaut: 10)")]
-        int n = 10)
-    {
-        if (_db == null) return "DB non initialisée.";
-
-        var messages = _db.GetRecentMessages(conversation_uuid, n);
-
-        if (messages.Count == 0)
-            return "Aucun message trouvé.";
-
-        var output = messages
-            .OrderBy(m => m.Index)
-            .Select(m => new
+            var r = keywordResults[i];
+            if (rrfScores.TryGetValue(r.Uuid, out var existing))
             {
-                sender  = m.Sender,
-                text    = m.Text,
-                date    = m.CreatedAt[..19],
-                thinking = m.Thinking
-            });
+                rrfScores[r.Uuid] = (existing.Score + (1.0 / (k + i + 1)), existing.Data);
+            }
+            else
+            {
+                rrfScores[r.Uuid] = (1.0 / (k + i + 1), r);
+            }
+        }
 
-        return JsonSerializer.Serialize(output, new JsonSerializerOptions
-        {
-            WriteIndented = true
-        });
+        // Sort by fused RRF score
+        var finalResults = rrfScores.Values
+            .OrderByDescending(x => x.Score)
+            .Take(limit)
+            .ToList();
+
+        if (finalResults.Count == 0)
+            return $"Désolé, je n'ai rien trouvé pour '{query}'. Essaie avec d'autres termes.";
+
+        return JsonSerializer.Serialize(
+            finalResults.Select(r => new
+            {
+                role = r.Data.Sender == "human" ? "Utilisateur" : "Assistant",
+                content = r.Data.Text,
+                date = r.Data.CreatedAt[..10],
+                relevance = Math.Round(r.Score * 100, 2),
+                conversation_id = r.Data.ConversationUuid
+            }),
+            new JsonSerializerOptions { WriteIndented = true });
     }
 
-    [McpServerTool, Description(
-        "Retourne les statistiques de la mémoire Mnemos : " +
-        "nombre de conversations et messages indexés.")]
+    [McpServerTool, Description("Donne l'état de santé de la mémoire de Mnemos (Stats et % d'indexation).")]
     public static string get_stats()
     {
-        if (_db == null) return "DB non initialisée.";
+        if (_db == null) return "Base de données inaccessible.";
+        
         var (convs, msgs) = _db.GetStats();
-        return $"{convs} conversations, {msgs} messages en mémoire.";
+        int embedded = _db.GetEmbeddedCount();
+        double percent = msgs > 0 ? Math.Round((double)embedded / msgs * 100, 1) : 0;
+        
+        return $"📊 Mémoire Mnemos :\n- Conversations : {convs}\n- Messages : {msgs}\n- Indexation Sémantique : {percent}% ({embedded}/{msgs})";
+    }
+
+    [McpServerTool, Description("Récupère le fil d'une discussion spécifique via son ID.")]
+    public static string get_recent_messages(string conversation_uuid, int n = 15)
+    {
+        if (_db == null) return "Base de données inaccessible.";
+        
+        var messages = _db.GetRecentMessages(conversation_uuid, n);
+        if (messages.Count == 0) return "Conversation introuvable.";
+
+        return JsonSerializer.Serialize(
+            messages.OrderBy(m => m.Index).Select(m => new {
+                sender = m.Sender,
+                text = m.Text,
+                date = m.CreatedAt,
+                thinking = m.Thinking
+            }), new JsonSerializerOptions { WriteIndented = true });
     }
 }
