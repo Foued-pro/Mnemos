@@ -64,12 +64,17 @@ public class CacheWatcher : IDisposable
                 {
                     foreach (var conv in convs)
                     {
-                        var lastMsg = conv.Messages.LastOrDefault();
-                        if (lastMsg != null)
+                        var humanMsg = conv.Messages.LastOrDefault(m => m.Sender == "human");
+                        var assistantMsg = conv.Messages.LastOrDefault(m => m.Sender == "assistant");
+
+                        if (humanMsg != null)
                         {
-                            string clean = lastMsg.Text.Replace("\n", " ").Replace("\r", "");
-                            string preview = clean.Length > 70 ? clean[..70] + "..." : clean;
-                            LogToAll($"[WATCH] Intercepted: {Path.GetFileName(path)}\n 💬 [{lastMsg.Sender.ToUpper()}] : {preview}");
+                            LogToAll($"[WATCH] [HUMAN] :\n{humanMsg.Text}");
+                        }
+
+                        if (assistantMsg != null)
+                        {
+                            LogToAll($"[WATCH] [ASSISTANT] :\n{assistantMsg.Text}");
                         }
                     }
                     yield return convs;

@@ -237,7 +237,7 @@ public class MnemosDb : IDisposable
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = @"
             SELECT uuid, text FROM messages
-            WHERE embedding IS NULL AND LENGTH(text) > 20
+            WHERE embedding IS NULL
             LIMIT @limit;";
         cmd.Parameters.AddWithValue("@limit", limit);
 

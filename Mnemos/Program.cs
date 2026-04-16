@@ -5,8 +5,6 @@ using Mnemos.Database;
 using Mnemos.Models;
 using Mnemos.Mcp;
 using Mnemos.Core;
-using System.Collections.Generic;
-using System.Linq;
 
 namespace Mnemos;
 
@@ -14,12 +12,11 @@ class Program
 {
     // Centralize AppData path for cleaner path building
     private static readonly string AppData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-
     private static readonly string BlobRoot = Path.Combine(AppData, @"Claude\IndexedDB\https_claude.ai_0.indexeddb.blob\1");
     private static readonly string CacheDir = Path.Combine(AppData, @"Claude\Cache\Cache_Data");
     private static readonly string ModelDir = Path.Combine(AppData, @"Claude\Models\minilm");
     private static readonly string LogFile = Path.Combine(AppData, @"Claude\mnemos.log");
-    
+
     private static readonly MnemosDb Db = new(Path.Combine(AppData, @"Claude\mnemos.db"));
     private static EmbeddingEngine? _embedder;
 
@@ -27,14 +24,19 @@ class Program
     static void Log(string message, string level = "INFO")
     {
         string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}";
-        Console.Error.WriteLine(line); // Outputs to Claude Desktop console
-        try { File.AppendAllText(LogFile, line + "\n"); } catch { } // Appends to PowerShell log
+        Console.Error.WriteLine(line); 
+
+        try 
+        { 
+            File.AppendAllText(LogFile, line + "\n"); 
+        } 
+        catch { }
     }
 
     // ── MAIN (MCP DAEMON) ─────────────────────────────────────────────────
     static async Task Main(string[] args)
     {
-        Log("Mnemos v4.0 starting...");
+        Log("Mnemos v4.0 (Daemon MCP) démarrage...");
 
         //  Database Initialization & Initial Sync
         var (_, mcpMsgs) = Db.GetStats();
@@ -61,7 +63,7 @@ class Program
         // Initialize MCP Tools
         McpTools.Init(Db, _embedder);
 
-        // Scheduled Embedding Generator
+        // 1. Thread ONNX (Background Indexing)
         if (_embedder != null)
         {
             _ = Task.Run(async () =>
@@ -71,17 +73,15 @@ class Program
                     while (true)
                     {
                         var msgs = Db.GetMessagesWithoutEmbedding(500);
-                        if (msgs.Count == 0)
-                        {
-                            await Task.Delay(TimeSpan.FromSeconds(5));
-                            continue;
-                        }
+                        if (msgs.Count == 0) { await Task.Delay(TimeSpan.FromSeconds(5)); continue; }
 
+                        int successCount = 0;
                         foreach (var (uuid, text) in msgs)
                         {
-                            try { Db.SaveEmbeddings(uuid, _embedder.GenerateEmbeddings(text)); }
-                            catch { /* Ignore local embedding errors to keep the loop alive */ }
+                            try { Db.SaveEmbeddings(uuid, _embedder.GenerateEmbeddings(text)); successCount++; }
+                            catch { }
                         }
+                        if (successCount > 0) Log($"[ONNX] Batch processed: {successCount} messages vectorized.");
                         await Task.Delay(1000);
                     }
                 }
@@ -97,40 +97,58 @@ class Program
                 using var watcher = new CacheWatcher(CacheDir);
                 await foreach (var convs in watcher.WatchAsync(CancellationToken.None))
                 {
-                    Db.SaveConversations(convs);
-
-                    // Immediate vectorization for real-time messages
-                    if (_embedder != null)
+                    if (convs.Count > 0)
                     {
-                        var newMsgs = Db.GetMessagesWithoutEmbedding(50);
-                        foreach (var (uuid, text) in newMsgs)
+                        Db.SaveConversations(convs);
+                        Log($"[CACHE] {convs.Count} conversation(s) interceptée(s)");
+
+                        if (_embedder != null)
                         {
-                            Db.SaveEmbeddings(uuid, _embedder.GenerateEmbeddings(text));
+                            var newMsgs = Db.GetMessagesWithoutEmbedding(50);
+                            foreach (var (uuid, text) in newMsgs)
+                                Db.SaveEmbeddings(uuid, _embedder.GenerateEmbeddings(text));
                         }
                     }
                 }
             }
-            catch (Exception ex) { Log($"[WATCH] Thread crashed: {ex.Message}", "ERROR"); }
+            catch (Exception ex) { Log($"[CACHE] Thread crashed: {ex.Message}", "ERROR"); }
+        });
+
+        // Real-time Blob Watcher (IndexedDB)
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var blobWatcher = new BlobWatcher(BlobRoot, ProcessBlob, msg => Log(msg));
+                await foreach (var convs in blobWatcher.WatchAsync(CancellationToken.None))
+                {
+                    if (convs.Count > 0)
+                    {
+                        Db.SaveConversations(convs);
+                        Log($"[BLOB] {convs.Count} conversations synchronized from IndexedDB.");
+                    }
+                }
+            }
+            catch (Exception ex) { Log($"[BLOB] Watcher crashed: {ex.Message}", "ERROR"); }
         });
 
         // Start MCP Stdio Server 
         var builder = Host.CreateApplicationBuilder(args);
-        
-        // Mute default ASP.NET logs to prevent JSON-RPC corruption over Stdio
-        builder.Logging.ClearProviders(); 
-        builder.Services.AddMcpServer().WithStdioServerTransport().WithToolsFromAssembly();
-        
-        Log("MCP Server running on Stdio.");
+        builder.Logging.ClearProviders();
+        builder.Services.AddMcpServer()
+                        .WithStdioServerTransport()
+                        .WithToolsFromAssembly();
+
+        Log("MCP Server started successfully (Stdio mode).");
         await builder.Build().RunAsync();
     }
 
-    // ── SYNC ──────────────────────────────────────────────────────────────
+    // ── SYNC & HELPERS ────────────────────────────────────────────────────
     static void SyncAll()
     {
         Log("[SYNC] Extracting history...");
         var allConversations = new List<Conversation>();
 
-        // Extract from IndexedDB (Historical data)
         if (Directory.Exists(BlobRoot))
         {
             foreach (var dir in Directory.GetDirectories(BlobRoot).OrderBy(d => d))
@@ -138,7 +156,6 @@ class Program
                     allConversations.AddRange(ProcessBlob(blobPath));
         }
 
-        // Extract from Cache (Recent data)
         if (Directory.Exists(CacheDir))
         {
             var seen = new HashSet<string>();
