@@ -11,7 +11,6 @@ public static class ConversationExtractor
 
         if (root is not Dictionary<string, object?> rootObj) return result;
         
-        // Navigate through Chromium's V8 object structure
         if (!rootObj.TryGetValue("clientState", out var cs) || cs is not Dictionary<string, object?> clientState) 
             return result;
         
@@ -78,10 +77,4 @@ public static class ConversationExtractor
 
         return result;
     }
-}
-
-public static class DictExtensions
-{
-    public static string GetString(this Dictionary<string, object?> dict, string key)
-        => dict.TryGetValue(key, out var v) && v is string s ? s : string.Empty;
 }

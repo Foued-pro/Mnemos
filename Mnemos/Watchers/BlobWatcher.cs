@@ -2,7 +2,7 @@
 using System.Runtime.CompilerServices;
 using Mnemos.Models;
 
-namespace Mnemos;
+namespace Mnemos.Watchers;
 
 public class BlobWatcher : IDisposable
 {

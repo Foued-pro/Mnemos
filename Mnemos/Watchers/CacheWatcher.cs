@@ -1,11 +1,11 @@
 ﻿using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
-using System.Text.Json;
-using ZstdSharp;
-using Mnemos.Models;
 using System.Text;
+using System.Text.Json;
+using Mnemos.Models;
+using ZstdSharp;
 
-namespace Mnemos;
+namespace Mnemos.Watchers;
 
 public class CacheWatcher : IDisposable
 {
@@ -13,12 +13,13 @@ public class CacheWatcher : IDisposable
     private readonly FileSystemWatcher _watcher;
     private readonly SemaphoreSlim _signal = new(0, 1);
     private readonly ConcurrentDictionary<string, byte> _seen = new();
+    private readonly Action<string> _logger;
 
-    public CacheWatcher(string cacheDir)
+    public CacheWatcher(string cacheDir, Action<string> logger)
     {
         _cacheDir = cacheDir;
+        _logger = logger;
 
-        // Index existing files to avoid reprocessing them on startup
         foreach (var f in Directory.GetFiles(cacheDir, "f_*"))
             _seen[f] = 0;
 
@@ -31,10 +32,9 @@ public class CacheWatcher : IDisposable
 
         _watcher.Created += (_, _) => SafeRelease();
         _watcher.Renamed += (_, _) => SafeRelease();
-
         _watcher.EnableRaisingEvents = true;
 
-        LogToAll($"[WATCH] Monitoring started on: {_cacheDir} ({_seen.Count} existing files ignored)");
+        _logger($"[WATCH] Monitoring started on: {_cacheDir} ({_seen.Count} existing files ignored)");
     }
 
     private void SafeRelease()
@@ -54,9 +54,8 @@ public class CacheWatcher : IDisposable
                 if (_seen.ContainsKey(path)) continue;
 
                 _seen[path] = 0;
-                LogToAll($"[WATCH] New cache file detected -> {Path.GetFileName(path)}");
+                _logger($"[WATCH] New cache file detected -> {Path.GetFileName(path)}");
 
-                // Give Chromium a moment to finish writing the Zstd stream
                 await Task.Delay(100, ct);
 
                 var convs = TryParseCache(path);
@@ -68,14 +67,10 @@ public class CacheWatcher : IDisposable
                         var assistantMsg = conv.Messages.LastOrDefault(m => m.Sender == "assistant");
 
                         if (humanMsg != null)
-                        {
-                            LogToAll($"[WATCH] [HUMAN] :\n{humanMsg.Text}");
-                        }
+                            _logger($"[WATCH] [HUMAN] :\n{humanMsg.Text}");
 
                         if (assistantMsg != null)
-                        {
-                            LogToAll($"[WATCH] [ASSISTANT] :\n{assistantMsg.Text}");
-                        }
+                            _logger($"[WATCH] [ASSISTANT] :\n{assistantMsg.Text}");
                     }
                     yield return convs;
                 }
@@ -103,9 +98,8 @@ public class CacheWatcher : IDisposable
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            List<Conversation> conversations = new();
+            var conversations = new List<Conversation>();
 
-            // Case 1: Array at root (Multiple conversations)
             if (root.ValueKind == JsonValueKind.Array)
             {
                 foreach (var item in root.EnumerateArray())
@@ -114,27 +108,22 @@ public class CacheWatcher : IDisposable
                     if (conv != null) conversations.Add(conv);
                 }
             }
-            // Case 2: Object at root
             else if (root.ValueKind == JsonValueKind.Object)
             {
-                // Direct messages array
                 if (root.TryGetProperty("chat_messages", out _) || root.TryGetProperty("messages", out _))
                 {
                     var conv = ParseSingleConversation(root);
                     if (conv != null) conversations.Add(conv);
                 }
-                // Nested arrays (plugins, has_more, etc.)
-                else 
+                else
                 {
                     foreach (var prop in root.EnumerateObject())
                     {
-                        if (prop.Value.ValueKind == JsonValueKind.Array)
+                        if (prop.Value.ValueKind != JsonValueKind.Array) continue;
+                        foreach (var item in prop.Value.EnumerateArray())
                         {
-                            foreach (var item in prop.Value.EnumerateArray())
-                            {
-                                var conv = ParseSingleConversation(item);
-                                if (conv != null) conversations.Add(conv);
-                            }
+                            var conv = ParseSingleConversation(item);
+                            if (conv != null) conversations.Add(conv);
                         }
                     }
                 }
@@ -150,14 +139,18 @@ public class CacheWatcher : IDisposable
         try
         {
             string uuid = el.TryGetProperty("uuid", out var u) ? u.GetString() ?? "" : "";
-            
+
             string name = "Conversation";
-            if (el.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String) name = n.GetString() ?? name;
-            else if (el.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String) name = t.GetString() ?? name;
+            if (el.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String)
+                name = n.GetString() ?? name;
+            else if (el.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String)
+                name = t.GetString() ?? name;
 
             JsonElement? messagesEl = null;
-            if (el.TryGetProperty("chat_messages", out var cm) && cm.ValueKind == JsonValueKind.Array) messagesEl = cm;
-            else if (el.TryGetProperty("messages", out var m) && m.ValueKind == JsonValueKind.Array) messagesEl = m;
+            if (el.TryGetProperty("chat_messages", out var cm) && cm.ValueKind == JsonValueKind.Array)
+                messagesEl = cm;
+            else if (el.TryGetProperty("messages", out var m) && m.ValueKind == JsonValueKind.Array)
+                messagesEl = m;
 
             if (!messagesEl.HasValue) return null;
 
@@ -168,11 +161,10 @@ public class CacheWatcher : IDisposable
                 string sender = msgEl.TryGetProperty("sender", out var s) ? s.GetString() ?? "unknown" : "unknown";
                 string msgUuid = msgEl.TryGetProperty("uuid", out var mu) ? mu.GetString() ?? Guid.NewGuid().ToString() : Guid.NewGuid().ToString();
                 string msgCreatedAt = msgEl.TryGetProperty("created_at", out var mc) ? mc.GetString() ?? "" : "";
-                
-                StringBuilder fullText = new();
+
+                var fullText = new StringBuilder();
                 string? thinking = null;
 
-                // Extract text and inner monologue from the "content" array
                 if (msgEl.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var block in content.EnumerateArray())
@@ -185,48 +177,24 @@ public class CacheWatcher : IDisposable
                     }
                 }
 
-                // Extract attachment contents if present
                 if (msgEl.TryGetProperty("attachments", out var attachments) && attachments.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var att in attachments.EnumerateArray())
                     {
                         if (att.TryGetProperty("extracted_content", out var ext) && !string.IsNullOrEmpty(ext.GetString()))
-                        {
                             fullText.Append("\n[Attachment] : " + ext.GetString());
-                        }
                     }
                 }
 
-                string finalResult = fullText.ToString().Trim();
-
-                // Skip tiny non-thinking messages to keep vector DB clean
-                if (finalResult.Length >= 10 || thinking != null)
-                {
-                    messages.Add(new ChatMessage(msgUuid, sender, finalResult, thinking, msgCreatedAt, uuid));
-                }
+                string finalText = fullText.ToString().Trim();
+                if (finalText.Length >= 10 || thinking != null)
+                    messages.Add(new ChatMessage(msgUuid, sender, finalText, thinking, msgCreatedAt, uuid));
             }
 
             if (messages.Count == 0) return null;
             return new Conversation(uuid, name, "", messages);
         }
-        catch (Exception ex)
-        {
-            LogToAll($"[PARSE] Error: {ex.Message}");
-            return null;
-        }
-    }
-
-    private static void LogToAll(string message)
-    {
-        string logLine = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}";
-        Console.Error.WriteLine(logLine); 
-        try
-        {
-            File.AppendAllText(
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"Claude\mnemos.log"),
-                logLine + "\n");
-        }
-        catch { }
+        catch { return null; }
     }
 
     public void Dispose()

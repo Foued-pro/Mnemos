@@ -5,12 +5,12 @@ using Mnemos.Database;
 using Mnemos.Models;
 using Mnemos.Mcp;
 using Mnemos.Core;
+using Mnemos.Watchers;
 
 namespace Mnemos;
 
 class Program
 {
-    // Centralize AppData path for cleaner path building
     private static readonly string AppData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
     private static readonly string BlobRoot = Path.Combine(AppData, @"Claude\IndexedDB\https_claude.ai_0.indexeddb.blob\1");
     private static readonly string CacheDir = Path.Combine(AppData, @"Claude\Cache\Cache_Data");
@@ -24,13 +24,12 @@ class Program
     static void Log(string message, string level = "INFO")
     {
         string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}";
-        Console.Error.WriteLine(line); 
-
         try 
         { 
             File.AppendAllText(LogFile, line + "\n"); 
         } 
         catch { }
+
     }
 
     // ── MAIN (MCP DAEMON) ─────────────────────────────────────────────────
@@ -51,7 +50,7 @@ class Program
         {
             try
             {
-                _embedder = new EmbeddingEngine(ModelDir);
+                _embedder = new EmbeddingEngine(ModelDir, msg => Log(msg));
                 Log("[ONNX] Semantic engine initialized.");
             }
             catch (Exception ex)
@@ -79,7 +78,10 @@ class Program
                         foreach (var (uuid, text) in msgs)
                         {
                             try { Db.SaveEmbeddings(uuid, _embedder.GenerateEmbeddings(text)); successCount++; }
-                            catch { }
+                            catch (Exception ex)
+                            {
+                                Log($"[ONNX] Embedding failed for {uuid}: {ex.Message}", "WARN");
+                            }
                         }
                         if (successCount > 0) Log($"[ONNX] Batch processed: {successCount} messages vectorized.");
                         await Task.Delay(1000);
@@ -94,7 +96,7 @@ class Program
         {
             try
             {
-                using var watcher = new CacheWatcher(CacheDir);
+                using var watcher = new CacheWatcher(CacheDir, msg => Log(msg));
                 await foreach (var convs in watcher.WatchAsync(CancellationToken.None))
                 {
                     if (convs.Count > 0)
@@ -181,11 +183,15 @@ class Program
     {
         try
         {
-            byte[]? v8Data = SnappyDecompressor.Decompress(path);
+            byte[]? v8Data = SnappyDecompressor.Decompress(path, msg => Log(msg, "WARN"));
             if (v8Data == null) return [];
-            var deserializer = new V8Deserializer(v8Data);
+            var deserializer = new V8Deserializer(v8Data, msg => Log(msg, "WARN"));
             return ConversationExtractor.Extract(deserializer.Deserialize());
         }
-        catch { return []; }
+        catch (Exception ex)
+        {
+            Log($"[BLOB] Failed to process {Path.GetFileName(path)}: {ex.Message}", "WARN");
+            return [];
+        }
     }
 }

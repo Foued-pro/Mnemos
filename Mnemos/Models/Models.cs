@@ -2,7 +2,7 @@
 
 public record ChatMessage(
     string Uuid,
-    string Sender, 
+    string Sender,
     string Text,
     string? Thinking,
     string CreatedAt,
@@ -15,4 +15,13 @@ public record Conversation(
     string Name,
     string CreatedAt,
     List<ChatMessage> Messages
+);
+
+public record SearchResult(
+    string Uuid,
+    string ConversationUuid,
+    string Sender,
+    string Text,
+    string CreatedAt,
+    double Relevance
 );

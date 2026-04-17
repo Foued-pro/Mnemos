@@ -1,5 +1,6 @@
 ﻿using Microsoft.Data.Sqlite;
 using System.Text.RegularExpressions;
+using Mnemos.Models;
 
 namespace Mnemos.Database;
 
@@ -12,15 +13,35 @@ public class MnemosDb : IDisposable
     {
         _conn = new SqliteConnection($"Data Source={dbPath}");
         _conn.Open();
-        
-        // Optimize SQLite for high concurrency (Write-Ahead Logging)
         Execute("PRAGMA journal_mode=WAL;");
         Execute("PRAGMA foreign_keys=ON;");
-        Initialize();
+        RunMigrations();
     }
 
-    // ── SCHEMA INITIALIZATION ─────────────────────────────────────────────
-    private void Initialize()
+    // ── MIGRATIONS ────────────────────────────────────────────────────────
+
+    private void RunMigrations()
+    {
+        int current = GetSchemaVersion();
+        if (current < 1) { ApplyMigration1(); SetSchemaVersion(1); }
+        // if (current < 2) { ApplyMigration2(); SetSchemaVersion(2); }
+    }
+
+    private int GetSchemaVersion()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "PRAGMA user_version;";
+        return Convert.ToInt32(cmd.ExecuteScalar());
+    }
+
+    private void SetSchemaVersion(int version)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"PRAGMA user_version = {version};";
+        cmd.ExecuteNonQuery();
+    }
+
+    private void ApplyMigration1()
     {
         Execute(@"
             CREATE TABLE IF NOT EXISTS conversations (
@@ -54,26 +75,6 @@ public class MnemosDb : IDisposable
                 FOREIGN KEY (message_uuid) REFERENCES messages(uuid) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS tool_calls (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_uuid TEXT    NOT NULL,
-                name         TEXT    NOT NULL,
-                arguments    TEXT,
-                result       TEXT,
-                FOREIGN KEY (message_uuid) REFERENCES messages(uuid) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS conversation_summaries (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_uuid TEXT    NOT NULL,
-                start_idx         INTEGER NOT NULL,
-                end_idx           INTEGER NOT NULL,
-                summary_text      TEXT    NOT NULL,
-                embedding         BLOB,
-                created_at        INTEGER NOT NULL,
-                FOREIGN KEY (conversation_uuid) REFERENCES conversations(uuid) ON DELETE CASCADE
-            );
-
             CREATE TABLE IF NOT EXISTS message_embeddings (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_uuid TEXT    NOT NULL,
@@ -81,15 +82,12 @@ public class MnemosDb : IDisposable
                 FOREIGN KEY (message_uuid) REFERENCES messages(uuid) ON DELETE CASCADE
             );
 
-            -- Performance Indexes
-            CREATE INDEX IF NOT EXISTS idx_msg_emb      ON message_embeddings(message_uuid);
-            CREATE INDEX IF NOT EXISTS idx_msgs_conv    ON messages(conversation_uuid, idx);
-            CREATE INDEX IF NOT EXISTS idx_msgs_date    ON messages(created_at);
-            CREATE INDEX IF NOT EXISTS idx_msgs_tier    ON messages(tier, created_at);
-            CREATE INDEX IF NOT EXISTS idx_code_msg     ON code_blocks(message_uuid);
-            CREATE INDEX IF NOT EXISTS idx_sum_conv     ON conversation_summaries(conversation_uuid);
+            CREATE INDEX IF NOT EXISTS idx_msg_emb   ON message_embeddings(message_uuid);
+            CREATE INDEX IF NOT EXISTS idx_msgs_conv ON messages(conversation_uuid, idx);
+            CREATE INDEX IF NOT EXISTS idx_msgs_date ON messages(created_at);
+            CREATE INDEX IF NOT EXISTS idx_msgs_tier ON messages(tier, created_at);
+            CREATE INDEX IF NOT EXISTS idx_code_msg  ON code_blocks(message_uuid);
 
-            -- FTS5 Virtual Tables for Full-Text Search (Trigram for partial matching)
             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
                 text, thinking,
                 content='messages', content_rowid='rowid', tokenize='trigram'
@@ -100,7 +98,6 @@ public class MnemosDb : IDisposable
                 content='code_blocks', content_rowid='rowid', tokenize='trigram'
             );
 
-            -- Auto-sync Triggers for FTS tables
             CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
                 INSERT INTO messages_fts(rowid, text, thinking)
                 VALUES (new.rowid, new.text, COALESCE(new.thinking, ''));
@@ -123,7 +120,8 @@ public class MnemosDb : IDisposable
     }
 
     // ── DATA PERSISTENCE ──────────────────────────────────────────────────
-    public void SaveConversations(List<Models.Conversation> conversations)
+
+    public void SaveConversations(List<Conversation> conversations)
     {
         lock (_dbLock)
         {
@@ -150,8 +148,6 @@ public class MnemosDb : IDisposable
 
                     foreach (var msg in conv.Messages)
                     {
-                        long msgCreatedAt = ToUnix(msg.CreatedAt);
-
                         ExecuteWithParams(@"
                             INSERT OR IGNORE INTO messages
                                 (uuid, conversation_uuid, sender, text, thinking, created_at, idx)
@@ -161,7 +157,7 @@ public class MnemosDb : IDisposable
                             ("@sender", msg.Sender),
                             ("@text", msg.Text ?? ""),
                             ("@thinking", msg.Thinking ?? (object)DBNull.Value),
-                            ("@created_at", msgCreatedAt),
+                            ("@created_at", ToUnix(msg.CreatedAt)),
                             ("@idx", msg.Index));
 
                         if (!string.IsNullOrWhiteSpace(msg.Text))
@@ -199,7 +195,8 @@ public class MnemosDb : IDisposable
         }
     }
 
-    // ── EMBEDDINGS & VECTORIZATION ────────────────────────────────────────
+    // ── EMBEDDINGS ────────────────────────────────────────────────────────
+
     public void SaveEmbeddings(string messageUuid, List<float[]> embeddings)
     {
         lock (_dbLock)
@@ -211,16 +208,15 @@ public class MnemosDb : IDisposable
 
                 foreach (var emb in embeddings)
                 {
-                    // Fast float[] to byte[] conversion for BLOB storage
                     byte[] bytes = new byte[emb.Length * 4];
                     Buffer.BlockCopy(emb, 0, bytes, 0, bytes.Length);
-                    ExecuteWithParams("INSERT INTO message_embeddings (message_uuid, embedding) VALUES (@uuid, @emb);",
-                        ("@uuid", messageUuid), ("@emb", bytes));
+                    ExecuteWithParams(
+                        "INSERT INTO message_embeddings (message_uuid, embedding) VALUES (@uuid, @emb);",
+                        ("@uuid", messageUuid),
+                        ("@emb", bytes));
                 }
 
-                // Mark as embedded
                 ExecuteWithParams("UPDATE messages SET embedding = X'' WHERE uuid = @uuid;", ("@uuid", messageUuid));
-
                 tx.Commit();
             }
             catch
@@ -235,16 +231,11 @@ public class MnemosDb : IDisposable
     {
         var results = new List<(string, string)>();
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = @"
-            SELECT uuid, text FROM messages
-            WHERE embedding IS NULL
-            LIMIT @limit;";
+        cmd.CommandText = "SELECT uuid, text FROM messages WHERE embedding IS NULL LIMIT @limit;";
         cmd.Parameters.AddWithValue("@limit", limit);
-
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
             results.Add((reader.GetString(0), reader.GetString(1)));
-
         return results;
     }
 
@@ -255,9 +246,8 @@ public class MnemosDb : IDisposable
         return Convert.ToInt32(cmd.ExecuteScalar());
     }
 
-    // ── SEARCH METHODS ────────────────────────────────────────────────────
-    
-    /// Keyword Search using FTS5 with custom relevance scoring (BM25 + Time Decay + Importance).
+    // ── SEARCH ────────────────────────────────────────────────────────────
+
     public List<SearchResult> Search(string query, int limit = 10, long tau = 2592000)
     {
         var results = new List<SearchResult>();
@@ -288,20 +278,15 @@ public class MnemosDb : IDisposable
 
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
-        {
             results.Add(new SearchResult(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.GetString(2),
+                reader.GetString(0), reader.GetString(1), reader.GetString(2),
                 reader.GetString(3),
                 DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(4)).ToString("o"),
-                reader.GetDouble(5)
-            ));
-        }
+                reader.GetDouble(5)));
+
         return results;
     }
-    
-    /// Semantic Search using in-memory Cosine Similarity against stored ONNX vectors.
+
     public List<SearchResult> SearchByEmbedding(float[] queryEmbedding, int limit = 20)
     {
         using var cmd = _conn.CreateCommand();
@@ -311,8 +296,7 @@ public class MnemosDb : IDisposable
             JOIN message_embeddings e ON m.uuid = e.message_uuid
             WHERE m.tier = 1;";
 
-        var allChunks = new List<(string uuid, string conv, string sender, string text, long date, float[] emb)>();
-
+        var chunks = new List<(string uuid, string conv, string sender, string text, long date, float[] emb)>();
         using (var reader = cmd.ExecuteReader())
         {
             while (reader.Read())
@@ -320,37 +304,23 @@ public class MnemosDb : IDisposable
                 byte[] bytes = (byte[])reader["embedding"];
                 float[] emb = new float[bytes.Length / 4];
                 Buffer.BlockCopy(bytes, 0, emb, 0, bytes.Length);
-
-                allChunks.Add((
-                    reader.GetString(0),
-                    reader.GetString(1),
-                    reader.GetString(2),
-                    reader.GetString(3),
-                    reader.GetInt64(4),
-                    emb
-                ));
+                chunks.Add((reader.GetString(0), reader.GetString(1), reader.GetString(2),
+                    reader.GetString(3), reader.GetInt64(4), emb));
             }
         }
 
-        // Calculate similarity in C# (workaround since SQLite lacks native vector math without extensions)
-        var groupedResults = allChunks
-            .Select(c => new { Data = c, Score = CosineSimilarity(queryEmbedding, c.emb) })
-            .Where(x => x.Score > 0.4)
-            .GroupBy(x => x.Data.uuid)
-            .Select(g => g.OrderByDescending(x => x.Score).First())
+        return chunks
+            .Select(c => new { c, score = CosineSimilarity(queryEmbedding, c.emb) })
+            .Where(x => x.score > 0.4f)
+            .GroupBy(x => x.c.uuid)
+            .Select(g => g.OrderByDescending(x => x.score).First())
             .Select(x => new SearchResult(
-                x.Data.uuid,
-                x.Data.conv,
-                x.Data.sender,
-                x.Data.text,
-                DateTimeOffset.FromUnixTimeSeconds(x.Data.date).ToString("o"),
-                x.Score
-            ))
+                x.c.uuid, x.c.conv, x.c.sender, x.c.text,
+                DateTimeOffset.FromUnixTimeSeconds(x.c.date).ToString("o"),
+                x.score))
             .OrderByDescending(r => r.Relevance)
             .Take(limit)
             .ToList();
-
-        return groupedResults;
     }
 
     private static float CosineSimilarity(float[] a, float[] b)
@@ -365,10 +335,11 @@ public class MnemosDb : IDisposable
         return dot / (MathF.Sqrt(normA) * MathF.Sqrt(normB) + 1e-9f);
     }
 
-    // ── DATA RETRIEVAL & MANAGEMENT ───────────────────────────────────────
-    public List<Models.ChatMessage> GetRecentMessages(string convUuid, int n = 10)
+    // ── RETRIEVAL ─────────────────────────────────────────────────────────
+
+    public List<ChatMessage> GetRecentMessages(string convUuid, int n = 10)
     {
-        var results = new List<Models.ChatMessage>();
+        var results = new List<ChatMessage>();
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = @"
             SELECT uuid, sender, text, thinking, created_at, idx
@@ -381,29 +352,13 @@ public class MnemosDb : IDisposable
 
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
-        {
-            results.Add(new Models.ChatMessage(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.GetString(2),
+            results.Add(new ChatMessage(
+                reader.GetString(0), reader.GetString(1), reader.GetString(2),
                 reader.IsDBNull(3) ? null : reader.GetString(3),
                 DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(4)).ToString("o"),
-                convUuid,
-                reader.GetInt32(5)
-            ));
-        }
-        return results;
-    }
+                convUuid, reader.GetInt32(5)));
 
-    public int ArchiveOldMessages(int daysOld = 30)
-    {
-        long cutoff = DateTimeOffset.UtcNow.AddDays(-daysOld).ToUnixTimeSeconds();
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = @"
-            UPDATE messages SET tier = 2
-            WHERE tier = 1 AND importance = 0 AND created_at < @cutoff;";
-        cmd.Parameters.AddWithValue("@cutoff", cutoff);
-        return cmd.ExecuteNonQuery();
+        return results;
     }
 
     public (int conversations, int messages) GetStats()
@@ -417,12 +372,11 @@ public class MnemosDb : IDisposable
     }
 
     // ── HELPERS ───────────────────────────────────────────────────────────
-    private static long ToUnix(string iso)
-    {
-        return DateTimeOffset.TryParse(iso, out var dto)
+
+    private static long ToUnix(string iso) =>
+        DateTimeOffset.TryParse(iso, out var dto)
             ? dto.ToUnixTimeSeconds()
             : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-    }
 
     private void Execute(string sql)
     {
@@ -442,12 +396,3 @@ public class MnemosDb : IDisposable
 
     public void Dispose() => _conn.Dispose();
 }
-
-public record SearchResult(
-    string Uuid,
-    string ConversationUuid,
-    string Sender,
-    string Text,
-    string CreatedAt,
-    double Relevance
-);

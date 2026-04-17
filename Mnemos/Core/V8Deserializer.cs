@@ -1,20 +1,27 @@
-﻿using System.Text;
-
-namespace Mnemos;
+﻿namespace Mnemos.Core;
 
 public class V8Deserializer
 {
     private readonly byte[] _data;
     private int _pos;
     private readonly List<object?> _refs = new();
+    private readonly Action<string>? _log;
 
-    public V8Deserializer(byte[] data)
+    public V8Deserializer(byte[] data, Action<string>? log = null)
     {
         _data = data;
-        _pos = 0;
+        _log = log;
     }
 
-    public object? Deserialize() => ReadValue();
+    public object? Deserialize()
+    {
+        try { return ReadValue(); }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"[V8] Parse failed at offset {_pos}: {ex.Message}");
+            return null;
+        }
+    }
 
     private object? ReadValue()
     {
@@ -23,12 +30,10 @@ public class V8Deserializer
             byte tag = _data[_pos++];
             switch (tag)
             {
-                // Control tags
                 case 0xFF: ReadVarint(); continue; // Version header
                 case 0x00: continue;               // Padding
                 case 0x3F: ReadVarint(); continue; // Object reference / padding
 
-                // Primitives
                 case 0x54: return true;            // 'T'
                 case 0x46: return false;           // 'F'
                 case 0x30: return null;            // '0' (The Hole)
@@ -54,7 +59,7 @@ public class V8Deserializer
                 case 0x22:                         // '"' (String Latin1)
                 {
                     int len = (int)ReadVarint();
-                    var s = Encoding.GetEncoding("ISO-8859-1").GetString(_data, _pos, len);
+                    var s = System.Text.Encoding.GetEncoding("ISO-8859-1").GetString(_data, _pos, len);
                     _pos += len;
                     return s;
                 }
@@ -62,7 +67,7 @@ public class V8Deserializer
                 case 0x63:                         // 'c' (String UTF-16)
                 {
                     int len = (int)ReadVarint();
-                    var s = Encoding.Unicode.GetString(_data, _pos, len);
+                    var s = System.Text.Encoding.Unicode.GetString(_data, _pos, len);
                     _pos += len;
                     return s;
                 }
@@ -76,7 +81,7 @@ public class V8Deserializer
                         if (ReadValue() is string key) obj[key] = ReadValue();
                     }
                     _pos++;
-                    ReadVarint(); 
+                    ReadVarint();
                     return obj;
                 }
 
@@ -97,15 +102,15 @@ public class V8Deserializer
 
                 case 0x61:                         // 'a' (Sparse Array)
                 {
-                    ReadVarint(); 
+                    ReadVarint();
                     var arr = new List<object?>();
                     _refs.Add(arr);
                     while (_pos < _data.Length && _data[_pos] != 0x40)
                     {
-                        ReadValue(); // index
+                        ReadValue();
                         arr.Add(ReadValue());
                     }
-                    _pos++; // Skip '@'
+                    _pos++;
                     ReadVarint(); ReadVarint();
                     return arr;
                 }
@@ -120,7 +125,7 @@ public class V8Deserializer
                 case 0x5E:                         // '^' (Back-reference)
                     return _refs.ElementAtOrDefault((int)ReadVarint());
 
-                case 0x5C: return null;            // '\' (Host Object)
+                case 0x5C: return null;            // '\' (Host Object - Blink, skipped)
 
                 default: return null;
             }

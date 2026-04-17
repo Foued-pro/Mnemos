@@ -3,7 +3,7 @@ using System.Text.Json;
 using ModelContextProtocol.Server;
 using Mnemos.Database;
 using Mnemos.Core;
-
+using Mnemos.Models;
 namespace Mnemos.Mcp;
 
 [McpServerToolType]

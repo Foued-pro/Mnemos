@@ -1,10 +1,6 @@
 ﻿using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using Microsoft.ML.Tokenizers;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 
 namespace Mnemos.Core;
 
@@ -12,14 +8,16 @@ public class EmbeddingEngine : IDisposable
 {
     private readonly InferenceSession _session;
     private readonly BertTokenizer _tokenizer;
-    
-    // MiniLM-L6-v2 specific constants
+    private readonly Action<string> _log;
+
     private const int Dimension = 384;
     private const int MaxTokens = 510;
-    private const int Overlap = 100;   
+    private const int Overlap = 100;
 
-    public EmbeddingEngine(string modelDir)
+    public EmbeddingEngine(string modelDir, Action<string> log)
     {
+        _log = log;
+
         string onnxPath = Path.Combine(modelDir, "model.onnx");
         string vocabPath = Path.Combine(modelDir, "vocab.txt");
 
@@ -31,11 +29,11 @@ public class EmbeddingEngine : IDisposable
         {
             options.AppendExecutionProvider_CUDA(0);
             options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
-            Console.Error.WriteLine("[ONNX] HW: NVIDIA CUDA activated!");
+            _log("[ONNX] CUDA activated.");
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[ONNX] CUDA failed ({ex.Message}), fallback to CPU.");
+            _log($"[ONNX] CUDA failed ({ex.Message}), fallback to CPU.");
             options = new SessionOptions();
             options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
         }
@@ -94,7 +92,7 @@ public class EmbeddingEngine : IDisposable
         using var results = _session.Run(inputs);
         var hidden = results.First(v => v.Name == "last_hidden_state").AsTensor<float>();
 
-        //  Average all token embeddings to get a single sentence vector
+        // Mean pooling over all token embeddings
         float[] pooled = new float[Dimension];
         for (int i = 0; i < seqLen; i++)
             for (int j = 0; j < Dimension; j++)
@@ -102,7 +100,7 @@ public class EmbeddingEngine : IDisposable
 
         for (int j = 0; j < Dimension; j++) pooled[j] /= seqLen;
 
-        // Scale vector to unit length for Cosine Similarity
+        // L2 normalization for cosine similarity
         float norm = (float)Math.Sqrt(pooled.Sum(x => x * x));
         for (int j = 0; j < Dimension; j++) pooled[j] /= Math.Max(norm, 1e-9f);
 
