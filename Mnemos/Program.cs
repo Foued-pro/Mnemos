@@ -20,7 +20,7 @@ class Program
     private static readonly MnemosDb Db = new(Path.Combine(AppData, @"Claude\mnemos.db"));
     private static EmbeddingEngine? _embedder;
 
-    // ── LOGGING ───────────────────────────────────────────────────────────
+    // ── LOGGING ──────────────────────────────────────────────────────────
     static void Log(string message, string level = "INFO")
     {
         string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}";
