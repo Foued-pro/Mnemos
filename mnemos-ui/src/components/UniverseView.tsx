@@ -116,18 +116,12 @@ const SCALE = 100;
 
 // ---------- Component ----------
 
-/**
- * 3D scatter plot of all indexed messages, projected via UMAP.
- * Supports time-based animation, cluster filtering, bloom toggle,
- * full-text search, and a detail panel for reading individual messages.
- */
 export default function UniverseView({ onConvClick, isDark = false }: Props) {
     const mountRef = useRef<HTMLDivElement>(null);
     const tooltipRef = useRef<HTMLDivElement>(null);
     const searchInputRef = useRef<HTMLInputElement>(null);
     const pointsRef = useRef<UniversePoint[]>([]);
 
-    // Commands exposed to the imperative Three.js scene
     const sceneActions = useRef<{
         focusOn: (x: number, y: number, z: number, zoom: number) => void;
         updateVisuals: (themeId: number | null, maxTime: number, query: string, selectedId: string | null) => void;
@@ -148,13 +142,11 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
     const [selectedPoint, setSelectedPoint] = useState<UniversePoint | null>(null);
     const [showLegend, setShowLegend] = useState(false);
 
-    // Keep a ref in sync for the Three.js event handlers (closures)
     const filtersRef = useRef({ activeTheme, searchQuery, selectedPoint });
     useEffect(() => {
         filtersRef.current = { activeTheme, searchQuery, selectedPoint };
     }, [activeTheme, searchQuery, selectedPoint]);
 
-    // Theme-dependent Tailwind class sets
     const t = {
         bg: isDark ? "bg-slate-950" : "bg-slate-50",
         panel: isDark ? "bg-slate-900/90 border-slate-800" : "bg-white/95 border-slate-200/80",
@@ -167,8 +159,6 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         badgeAssistant: isDark ? "bg-slate-800 text-slate-400" : "bg-slate-100 text-slate-600",
         progressTrack: isDark ? "bg-slate-800" : "bg-slate-100",
     };
-
-    // ---------- Keyboard shortcuts ----------
 
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
@@ -184,8 +174,6 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         window.addEventListener("keydown", handleKeyDown);
         return () => window.removeEventListener("keydown", handleKeyDown);
     }, [selectedPoint, showLegend]);
-
-    // ---------- Backend communication ----------
 
     useEffect(() => {
         const webview = (window as any).chrome?.webview;
@@ -249,12 +237,10 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         };
     }, []);
 
-    // ---------- Time animation ----------
-
     useEffect(() => {
         let req: number;
         let lastUpdate = performance.now();
-        const durationMs = 12000; // full playback length
+        const durationMs = 12000;
         const step = () => {
             const now = performance.now();
             const dt = now - lastUpdate;
@@ -275,7 +261,6 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         return () => cancelAnimationFrame(req);
     }, [isPlaying, timeRange]);
 
-    // Push filter changes into the Three.js scene
     useEffect(() => {
         sceneActions.current?.updateVisuals(activeTheme, timeCursor, searchQuery, selectedPoint?.Uuid || null);
     }, [activeTheme, timeCursor, searchQuery, selectedPoint]);
@@ -284,15 +269,10 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         sceneActions.current?.updateTheme(isDark, glowEnabled);
     }, [isDark, glowEnabled]);
 
-    // ---------- Detail panel ----------
-
-    /** Closes the selected point detail panel and resets the camera. */
     const handleCloseDetail = () => {
         setSelectedPoint(null);
         sceneActions.current?.focusOn(0, 0, 0, 200);
     };
-
-    // ---------- Three.js initialization ----------
 
     useEffect(() => {
         if (!mountRef.current || points.length === 0) return;
@@ -318,13 +298,13 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         controls.maxDistance = 400;
         controls.minDistance = 5;
         controls.autoRotate = true;
-        controls.autoRotateSpeed = 1.0;
+        // FIX: Increased rotation speed so it's not too slow
+        controls.autoRotateSpeed = 2.5;
 
-        // Bloom post-processing
         const renderScene = new RenderPass(scene, camera);
         const bloomPass = new UnrealBloomPass(new THREE.Vector2(width, height), 1.5, 0.4, 0.85);
         bloomPass.threshold = 0.0;
-        bloomPass.strength = 1.8;
+        bloomPass.strength = isDark ? 1.8 : 0.5; // Initial bloom strength based on theme
         bloomPass.radius = 0.5;
         bloomPass.enabled = false;
 
@@ -332,7 +312,6 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         composer.addPass(renderScene);
         composer.addPass(bloomPass);
 
-        // Camera flight state
         let targetFocus = new THREE.Vector3(0, 0, 0);
         let targetCamPos = new THREE.Vector3(0, 0, 200);
         let isFlying = false;
@@ -348,13 +327,12 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
             if (!filtersRef.current.selectedPoint) {
                 idleTimer = setTimeout(() => {
                     controls.autoRotate = true;
-                }, 4000);
+                }, 1000);
             }
         };
         controls.addEventListener("start", onInteractionStart);
         controls.addEventListener("end", onInteractionEnd);
 
-        // Build point cloud geometry
         const positions = new Float32Array(points.length * 3);
         const colors = new Float32Array(points.length * 3);
 
@@ -373,17 +351,33 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
         geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 
+        // FIX: Create a circular texture so points are circles, not squares
+        const createCircleTexture = () => {
+            const canvas = document.createElement("canvas");
+            canvas.width = 64;
+            canvas.height = 64;
+            const ctx = canvas.getContext("2d");
+            if (ctx) {
+                ctx.beginPath();
+                ctx.arc(32, 32, 30, 0, Math.PI * 2);
+                ctx.fillStyle = "#ffffff";
+                ctx.fill();
+            }
+            return new THREE.CanvasTexture(canvas);
+        };
+
         const material = new THREE.PointsMaterial({
-            size: 3,
+            size: 4, // Slightly larger because we cropped the edges
+            map: createCircleTexture(),
+            alphaTest: 0.1, // This removes the black/transparent square edges
             vertexColors: true,
             sizeAttenuation: true,
             transparent: true,
             opacity: isDark ? 1.0 : 0.85,
         });
+
         const particles = new THREE.Points(geometry, material);
         scene.add(particles);
-
-        // ---- Imperative scene API ----
 
         sceneActions.current = {
             focusOn: (x, y, z, zoomDistance) => {
@@ -402,7 +396,7 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
                         targetCamPos.copy(camera.position);
                         isFlying = true;
                         controls.autoRotate = true;
-                    }, 4000);
+                    }, 1000);
                 }
             },
             updateVisuals: (themeId, maxTime, query, selectedId) => {
@@ -440,11 +434,11 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
                 scene.background = new THREE.Color(targetColor);
                 scene.fog = new THREE.FogExp2(targetColor, 0.002);
                 bloomPass.enabled = glow;
+                // FIX: Lower bloom intensity in light mode so it's readable
+                bloomPass.strength = dark ? 1.8 : 0.5;
                 material.opacity = dark ? 1.0 : 0.85;
             },
         };
-
-        // ---- Raycaster for hover + click ----
 
         const raycaster = new THREE.Raycaster();
         raycaster.params.Points!.threshold = 2;
@@ -575,7 +569,6 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         };
     }, [points, isDark]);
 
-    // Listen for point selection events from the 3D canvas
     useEffect(() => {
         const handlePointSelect = (e: any) => {
             const p = e.detail;
@@ -587,8 +580,6 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         return () => window.removeEventListener("pointSelected", handlePointSelect);
     }, []);
 
-    // ---------- Cluster legend ----------
-
     const handleThemeClick = (clusterId: number) => {
         handleCloseDetail();
         if (activeTheme === clusterId) {
@@ -596,23 +587,10 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
             return;
         }
         setActiveTheme(clusterId);
-        const clusterPoints = points.filter((p) => p.ClusterId === clusterId);
-        if (clusterPoints.length === 0) return;
-        let cx = 0, cy = 0, cz = 0;
-        clusterPoints.forEach((p) => {
-            cx += p.X * SCALE;
-            cy += p.Y * SCALE;
-            cz += p.Z * SCALE;
-        });
-        sceneActions.current?.focusOn(
-            cx / clusterPoints.length,
-            cy / clusterPoints.length,
-            cz / clusterPoints.length,
-            100
-        );
+        // FIX: Removed the sceneActions.current?.focusOn() call here
+        // The camera won't move anymore when clicking on a legend topic
     };
 
-    // Points visible according to current filters and time cursor
     const visiblePoints = points.filter((p) => {
         const pTime = new Date(p.Date || Date.now()).getTime();
         if (pTime > timeCursor) return false;
@@ -623,8 +601,6 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
         return true;
     });
     const visibleClusterIds = Array.from(new Set(visiblePoints.map((p) => p.ClusterId))).sort((a, b) => a - b);
-
-    // ---------- Render ----------
 
     return (
         <div className={`w-full h-full relative overflow-hidden transition-colors duration-1000 ${t.bg}`}>
@@ -714,9 +690,9 @@ export default function UniverseView({ onConvClick, isDark = false }: Props) {
                         </div>
                     </div>
 
-                    {/* Cluster legend */}
+                    {/* Cluster legend - FIX: Width changed from w-[210px] to w-[260px] */}
                     <div className={`absolute top-14 right-3 bottom-16 z-[110] transition-all duration-500 ${selectedPoint ? "opacity-0 translate-x-6 pointer-events-none" : "opacity-100"} ${showLegend ? "pointer-events-auto" : "pointer-events-none sm:pointer-events-auto"}`}>
-                        <div className={`backdrop-blur-md border rounded-xl p-3 shadow-xl w-[210px] h-fit max-h-[calc(100%-60px)] flex flex-col transition-all duration-500 ${t.panel} ${showLegend ? "opacity-100 translate-x-0" : "opacity-0 translate-x-4 sm:opacity-100 sm:translate-x-0"}`}>
+                        <div className={`backdrop-blur-md border rounded-xl p-3 shadow-xl w-[260px] h-fit max-h-[calc(100%-60px)] flex flex-col transition-all duration-500 ${t.panel} ${showLegend ? "opacity-100 translate-x-0" : "opacity-0 translate-x-4 sm:opacity-100 sm:translate-x-0"}`}>
                             <p className={`text-[10px] uppercase font-black tracking-wider border-b pb-2 mb-2 shrink-0 ${isDark ? "text-slate-500 border-slate-800" : "text-slate-400 border-slate-100"}`}>
                                 Topics
                             </p>

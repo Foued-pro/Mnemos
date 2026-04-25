@@ -17,6 +17,7 @@ mnemos-ui/node_modules/
 mnemos-ui/dist/
 mnemos-ui/dist-ssr/
 mnemos-ui/*.local
+Mnemos.App/wwwroot/
 
 # --- Node (Mnemos/) ---
 Mnemos/node_modules/

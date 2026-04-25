@@ -26,6 +26,7 @@ public partial class MainWindow : Window
     private EmbeddingEngine? _embedder;
     private GraphBuilder? _graphBuilder;
     private UmapEngine? _umapEngine;
+    private System.Diagnostics.Process? _mcpProcess;
 
     // ---------- Graph state ----------
 
@@ -83,6 +84,10 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         SetThemeColors(false);
+        this.Closed += (s, e) => Environment.Exit(0);
+        Directory.CreateDirectory(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Claude"));
         AutoConfigureMcp();
 
         try
@@ -152,7 +157,6 @@ public partial class MainWindow : Window
         _webviewReady = true;
         Log("WebView ready");
 
-        LaunchMcpServer();
         _ = BuildGraphAsync();
         _ = ComputeUmapAsync();
     }
@@ -516,64 +520,9 @@ public partial class MainWindow : Window
 
     // ---------- MCP server management ----------
 
-    /// <summary>
-    /// Starts the standalone Mnemos MCP server process (Mnemos.exe) if present.
-    /// </summary>
-    private void LaunchMcpServer()
-    {
-        try
-        {
-            string mcpExe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Mnemos.exe");
-
-            if (!File.Exists(mcpExe))
-            {
-                Log("Mnemos.exe not found");
-                Post("mcp_status|disconnected");
-                return;
-            }
-
-            var psi = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName               = mcpExe,
-                UseShellExecute        = false,
-                CreateNoWindow         = true,
-                RedirectStandardOutput = false
-            };
-
-            var process = System.Diagnostics.Process.Start(psi);
-            Log($"MCP Server started (PID {process?.Id})");
-
-            _ = Task.Delay(1000).ContinueWith(_ =>
-            {
-                if (_db != null)
-                {
-                    var (_, msgs) = _db.GetStats();
-                    Post($"mcp_status|{(msgs > 0 ? "connected" : "disconnected")}");
-                }
-            });
-
-            _ = Task.Run(async () =>
-            {
-                while (true)
-                {
-                    await Task.Delay(10000);
-                    if (_db != null)
-                    {
-                        var (_, msgs) = _db.GetStats();
-                        Post($"mcp_status|{(msgs > 0 ? "connected" : "disconnected")}");
-                    }
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            Log($"LaunchMcpServer: {ex.Message}");
-            Post("mcp_status|disconnected");
-        }
-    }
 
     /// <summary>
-    /// Writes the Mnemos MCP server entry to Claude Desktop's configuration file.
+    /// Writes the Mnemos MCP server entry to Claude Desktop's configuration file safely.
     /// </summary>
     private void AutoConfigureMcp()
     {
@@ -585,25 +534,52 @@ public partial class MainWindow : Window
 
             string exePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Mnemos.exe");
 
-            var config = File.Exists(configPath)
-                ? JsonSerializer.Deserialize<System.Text.Json.Nodes.JsonNode>(
-                    File.ReadAllText(configPath)) ?? new System.Text.Json.Nodes.JsonObject()
-                : new System.Text.Json.Nodes.JsonObject();
+            Log($"configPath: {configPath}");
+            Log($"exePath: {exePath}");
+            Log($"config exists: {File.Exists(configPath)}");
+            Log($"exe exists: {File.Exists(exePath)}");
 
-            config["mcpServers"] ??= new System.Text.Json.Nodes.JsonObject();
-            config["mcpServers"]!["mnemos"] = new System.Text.Json.Nodes.JsonObject
+            System.Text.Json.Nodes.JsonObject configObj;
+
+            if (File.Exists(configPath))
+            {
+                string rawJson = File.ReadAllText(configPath);
+                Log($"raw config: {rawJson}");
+            
+                var documentOptions = new JsonDocumentOptions 
+                { 
+                    AllowTrailingCommas = true, 
+                    CommentHandling = JsonCommentHandling.Skip 
+                };
+            
+                var node = System.Text.Json.Nodes.JsonNode.Parse(rawJson, null, documentOptions);
+                configObj = node?.AsObject() ?? new System.Text.Json.Nodes.JsonObject();
+            }
+            else
+            {
+                Log("config not found, creating new");
+                configObj = new System.Text.Json.Nodes.JsonObject();
+            }
+
+            if (!configObj.ContainsKey("mcpServers"))
+                configObj.Add("mcpServers", new System.Text.Json.Nodes.JsonObject());
+
+            configObj["mcpServers"]!["mnemos"] = new System.Text.Json.Nodes.JsonObject
             {
                 ["command"] = exePath
             };
 
-            File.WriteAllText(configPath,
-                JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
+            var writeOptions = new JsonSerializerOptions { WriteIndented = true };
+            string final = configObj.ToJsonString(writeOptions);
+            Log($"🔧 writing: {final}");
+            File.WriteAllText(configPath, final);
 
             Log("MCP auto-configured");
         }
         catch (Exception ex)
         {
-            Log($"AutoConfigureMcp: {ex.Message}");
+            Log($"AutoConfigureMcp: {ex.GetType().Name}: {ex.Message}");
+            Log($"Stack: {ex.StackTrace}");
         }
     }
 
@@ -614,12 +590,13 @@ public partial class MainWindow : Window
     /// </summary>
     private void Post(string message)
     {
-        if (!_webviewReady || webView?.CoreWebView2 == null) return;
+        if (!_webviewReady) return;
 
         Dispatcher.BeginInvoke(() =>
         {
             try
             {
+                if (webView?.CoreWebView2 == null) return;
                 webView.CoreWebView2.PostWebMessageAsString(message);
             }
             catch (Exception ex)
@@ -653,6 +630,16 @@ public partial class MainWindow : Window
     }
 
     /// <summary>Writes a diagnostic message to the debug output.</summary>
-    private static void Log(string msg) =>
+    private void Log(string msg)
+    {
         System.Diagnostics.Debug.WriteLine($"[MNEMOS] {msg}");
+        try
+        {
+            string logPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "Claude", "mnemos-app.log");
+            File.AppendAllText(logPath, $"[{DateTime.Now:HH:mm:ss}] {msg}\n");
+        }
+        catch { }
+    }
 }

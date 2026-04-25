@@ -56,8 +56,17 @@ internal static class Program
     /// Main entry point: synchronizes existing history, starts watchers
     /// and the embedding background thread, then runs the MCP host.
     /// </summary>
+    
+    private static Mutex? _appMutex;
     private static async Task Main(string[] args)
     {
+        const string mutexName = "MnemosApp_McpServer";
+        _appMutex = new Mutex(true, mutexName, out bool createdNew);
+        if (!createdNew)
+        {
+            return;   
+        }
+        using var cts = new CancellationTokenSource();
         // Ensure stdout is left untouched for MCP JSON-RPC transport.
         Console.OutputEncoding = Encoding.UTF8;
         Console.InputEncoding  = Encoding.UTF8;
@@ -67,7 +76,7 @@ internal static class Program
             // Reset log file for clean session
             try { File.WriteAllText(LogFile, string.Empty); } catch { }
 
-            Log("Mnemos v4.2 starting");
+            Log("Mnemos v1.1 starting");
 
             // 1. Import all existing conversations
             SyncAll();
@@ -95,25 +104,34 @@ internal static class Program
 
             // 4. Start background embedding thread (if engine loaded)
             if (_embedder != null)
-                StartEmbeddingThread();
+                StartEmbeddingThread(cts.Token);
 
             // 5. Start file system watchers (cache + blob)
-            StartWatchers();
-
+            StartWatchers(cts.Token);
             // 6. Build and run the MCP host on stdio
+            Log("Mnemos is now watching Claude. Ready.");
+
             var builder = Host.CreateApplicationBuilder(args);
             builder.Logging.ClearProviders();
             builder.Services.AddMcpServer()
                 .WithStdioServerTransport()
                 .WithToolsFromAssembly();
 
-            Log("Mnemos is now watching Claude. Ready.");
-            await builder.Build().RunAsync();
+            var host = builder.Build();
+            var hostLifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
+            hostLifetime.ApplicationStopping.Register(() => cts.Cancel());
+
+            await host.RunAsync();
         }
         catch (Exception fatalEx)
         {
             Log($"FATAL: {fatalEx}", "FATAL");
             throw;
+        }
+        finally
+        {
+            _appMutex?.ReleaseMutex();
+            _appMutex?.Dispose();
         }
     }
 
@@ -122,18 +140,18 @@ internal static class Program
     /// <summary>
     /// Continuously polls for messages without embeddings and processes them in batches.
     /// </summary>
-    private static void StartEmbeddingThread()
+    private static void StartEmbeddingThread(CancellationToken ct)
     {
         _ = Task.Run(async () =>
         {
-            while (true)
+            while (!ct.IsCancellationRequested)
             {
                 try
                 {
                     var msgs = Db.GetMessagesWithoutEmbedding(100);
                     if (msgs.Count == 0)
                     {
-                        await Task.Delay(5000);
+                        await Task.Delay(5000, ct);
                         continue;
                     }
 
@@ -141,6 +159,7 @@ internal static class Program
                     {
                         try
                         {
+                            if (ct.IsCancellationRequested) break;
                             Db.SaveEmbeddings(uuid, _embedder!.GenerateEmbeddings(text));
                         }
                         catch (Exception ex)
@@ -154,7 +173,8 @@ internal static class Program
                 catch (Exception ex)
                 {
                     Log($"Embedding thread error: {ex.Message}", "ERROR");
-                    await Task.Delay(10000);
+                    await Task.Delay(10000, ct);
+                    
                 }
             }
         });
@@ -229,7 +249,7 @@ internal static class Program
     /// Starts the cache watcher (live conversation updates) and the blob watcher
     /// (history changes) on separate background tasks.
     /// </summary>
-    private static void StartWatchers()
+    private static void StartWatchers(CancellationToken ct)
     {
         // Watch the HTTP cache for real-time conversation changes
         _ = Task.Run(async () =>
@@ -237,7 +257,7 @@ internal static class Program
             try
             {
                 using var watcher = new CacheWatcher(CacheDir, msg => Log(msg, "CACHE"));
-                await foreach (var convs in watcher.WatchAsync(CancellationToken.None))
+                await foreach (var convs in watcher.WatchAsync(ct))
                 {
                     if (convs.Count > 0)
                     {
@@ -258,7 +278,7 @@ internal static class Program
             try
             {
                 using var blobWatcher = new BlobWatcher(BlobRoot, ProcessBlob, msg => Log(msg, "BLOB"));
-                await foreach (var convs in blobWatcher.WatchAsync(CancellationToken.None))
+                await foreach (var convs in blobWatcher.WatchAsync(ct))
                 {
                     if (convs.Count > 0)
                     {
