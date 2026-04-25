@@ -4,22 +4,33 @@ using Mnemos.Models;
 
 namespace Mnemos.Watchers;
 
+/// <summary>
+/// Watches the IndexedDB blob directory for changes using <see cref="FileSystemWatcher"/>
+/// and yields extracted <see cref="Conversation"/> batches as they are detected.
+/// Uses a semaphore for debouncing and a size-based cache to avoid re-processing.
+/// </summary>
 public class BlobWatcher : IDisposable
 {
     private readonly string _blobRoot;
     private readonly FileSystemWatcher _watcher;
     private readonly SemaphoreSlim _signal = new(0, 1);
     private readonly ConcurrentDictionary<string, long> _seen = new();
-    
+
     // Injected delegate for V8 deserialization to avoid tight coupling
     private readonly Func<string, List<Conversation>> _processBlobFunc;
     private readonly Action<string> _logger;
 
+    /// <summary>
+    /// Initializes the watcher on the given blob storage directory.
+    /// </summary>
+    /// <param name="blobRoot">Path to the IndexedDB blob folder.</param>
+    /// <param name="processBlobFunc">Function that decompresses and parses a blob file into conversations.</param>
+    /// <param name="logger">Logging callback.</param>
     public BlobWatcher(string blobRoot, Func<string, List<Conversation>> processBlobFunc, Action<string> logger)
     {
-        _blobRoot = blobRoot;
-        _processBlobFunc = processBlobFunc;
-        _logger = logger;
+        _blobRoot         = blobRoot;
+        _processBlobFunc  = processBlobFunc;
+        _logger           = logger;
 
         _logger($"[BLOB] Initializing watcher on: {_blobRoot}");
 
@@ -29,16 +40,16 @@ public class BlobWatcher : IDisposable
         }
         else
         {
-            int dirs = Directory.GetDirectories(_blobRoot).Length;
+            int dirs  = Directory.GetDirectories(_blobRoot).Length;
             int files = Directory.GetFiles(_blobRoot, "*", SearchOption.AllDirectories).Length;
             _logger($"[BLOB] Directory found → {dirs} subdirectories, {files} files total");
         }
-        
+
         _watcher = new FileSystemWatcher(blobRoot)
         {
             IncludeSubdirectories = true,
-            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
-            InternalBufferSize = 65536
+            NotifyFilter          = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+            InternalBufferSize    = 65536
         };
 
         _watcher.Created += (_, _) => Signal();
@@ -49,6 +60,9 @@ public class BlobWatcher : IDisposable
         _logger("[BLOB] FileSystemWatcher started");
     }
 
+    /// <summary>
+    /// Releases the semaphore to trigger a scan. Safe to call concurrently.
+    /// </summary>
     private void Signal()
     {
         try
@@ -56,9 +70,18 @@ public class BlobWatcher : IDisposable
             if (_signal.CurrentCount == 0)
                 _signal.Release();
         }
-        catch { }
+        catch
+        {
+            // Already signaled, ignore.
+        }
     }
 
+    /// <summary>
+    /// Yields conversation batches as new or modified blobs are detected.
+    /// Performs a full scan on the first iteration, then watches for FS events
+    /// with a 2-second polling fallback.
+    /// </summary>
+    /// <param name="ct">Cancellation token to stop watching.</param>
     public async IAsyncEnumerable<List<Conversation>> WatchAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -70,8 +93,8 @@ public class BlobWatcher : IDisposable
             await _signal.WaitAsync(TimeSpan.FromSeconds(2), ct);
 
             var allFiles = Directory.GetFiles(_blobRoot, "*", SearchOption.AllDirectories)
-                                    .OrderBy(f => f)
-                                    .ToList();
+                .OrderBy(f => f)
+                .ToList();
 
             if (isFirstScan)
                 _logger($"[BLOB] First full scan: {allFiles.Count} files found");
@@ -101,7 +124,6 @@ public class BlobWatcher : IDisposable
                 List<Conversation>? convs = null;
                 try
                 {
-                    // Process the binary blob
                     convs = _processBlobFunc(path);
                 }
                 catch (Exception ex)
@@ -114,7 +136,7 @@ public class BlobWatcher : IDisposable
                     _logger($"[BLOB] {convs.Count} conversation(s) extracted successfully");
                     foreach (var conv in convs)
                         _logger($"[BLOB]    → \"{conv.Name}\" ({conv.Messages.Count} messages)");
-                    
+
                     yield return convs;
                 }
                 else if (convs != null)
@@ -127,6 +149,9 @@ public class BlobWatcher : IDisposable
         }
     }
 
+    /// <summary>
+    /// Disposes the underlying <see cref="FileSystemWatcher"/> and semaphore.
+    /// </summary>
     public void Dispose()
     {
         _watcher.Dispose();

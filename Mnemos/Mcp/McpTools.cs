@@ -1,117 +1,250 @@
 ﻿using System.ComponentModel;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using ModelContextProtocol.Server;
 using Mnemos.Database;
 using Mnemos.Core;
 using Mnemos.Models;
+
 namespace Mnemos.Mcp;
 
+/// <summary>
+/// Static container for all MCP tool handlers.
+/// Initialized once with the database and embedding engine references.
+/// </summary>
 [McpServerToolType]
 public static class McpTools
 {
     private static MnemosDb? _db;
     private static EmbeddingEngine? _embedder;
+    private static Action<string, string>? _logger;
 
-    public static void Init(MnemosDb db, EmbeddingEngine? embedder = null)
+    /// <summary>
+    /// Injects the shared database and embedding engine into the tool handlers.
+    /// Must be called once on startup.
+    /// </summary>
+    /// <param name="db">The Mnemos database connection.</param>
+    /// <param name="embedder">Optional semantic embedding engine.</param>
+    /// <param name="logger">Optional callback for diagnostic logs (message, level).</param>
+    public static void Init(MnemosDb db, EmbeddingEngine? embedder = null, Action<string, string>? logger = null)
     {
-        _db = db;
+        _db       = db;
         _embedder = embedder;
+        _logger   = logger;
     }
 
+    // ── Hybrid search (unfiltered) ─────────────────────────
+
+    /// <summary>
+    /// Hybrid search combining full-text (FTS5/BM25) and semantic (cosine similarity)
+    /// results using Reciprocal Rank Fusion.
+    /// </summary>
+    /// <param name="query">Natural language query.</param>
+    /// <param name="limit">Number of results (default 5).</param>
+    /// <returns>JSON array of results with role, content, date, relevance, and conversation ID.</returns>
     [McpServerTool, Description(
-        "Outil de recherche hybride (FTS5 + Vecteurs sémantiques). " +
-        "Idéal pour retrouver des concepts, des idées ou des messages spécifiques " +
-        "même si les mots exacts diffèrent, grâce à la recherche par similarité cosinus.")]
+        "Hybrid search tool (FTS5 + semantic vectors). " +
+        "Perfect for finding concepts, ideas, or specific messages " +
+        "even when the exact words differ.")]
     public static string search_hybrid(
-        [Description("La requête en langage naturel (ex: 'études au japon', 'bug python')")] string query,
-        [Description("Nombre de résultats (défaut: 5)")] int limit = 5)
+        [Description("Natural language query (e.g.: 'studies in japan', 'python bug')")] string query,
+        [Description("Number of results (default: 5)")] int limit = 5)
     {
-        if (_db == null || _embedder == null) 
-            return "Système sémantique non initialisé. Vérifie les logs GPU/CPU.";
+        return Search(query, "all", limit);
+    }
 
-        // 1. Keyword Search (FTS5)  Sanitize input to prevent SQLite syntax errors
-        string safeQuery = System.Text.RegularExpressions.Regex.Replace(query, @"[^\w\s]", " ");
-        var keywordResults = _db.Search(safeQuery, 20);
+    // ── Hybrid search (filtered by language) ────────────────
 
-        // 2. Semantic Search (Embeddings)  Use the first chunk for short queries
-        var queryVectors = _embedder.GenerateEmbeddings(query);
-        if (queryVectors.Count == 0) return "Requête trop courte ou invalide.";
-        
-        var queryEmb = queryVectors[0];
-        var semanticResults = _db.SearchByEmbedding(queryEmb, 25);
+    /// <summary>
+    /// Hybrid search with an additional programming language filter
+    /// (only messages containing code blocks of that language).
+    /// </summary>
+    /// <param name="query">Natural language query.</param>
+    /// <param name="filter">Language filter (e.g. "csharp", "python").</param>
+    /// <param name="limit">Number of results (default 10).</param>
+    [McpServerTool, Description(
+        "Hybrid search filtered by programming language. " +
+        "Returns only messages containing code blocks of the specified language.")]
+    public static string search_hybrid_filtered(
+        [Description("Natural language query")] string query,
+        [Description("Language filter (e.g. csharp, python)")] string filter,
+        [Description("Number of results (default: 10)")] int limit = 10)
+    {
+        return Search(query, filter, limit);
+    }
 
-        // 3. Reciprocal Rank Fusion (RRF) to combine keyword and semantic results
+    // ── Core search engine (shared) ─────────────────────────
+
+    /// <summary>
+    /// Performs the actual hybrid search: strips punctuation, runs FTS5 and
+    /// semantic queries, merges them via Reciprocal Rank Fusion, and returns JSON.
+    /// </summary>
+    private static string Search(string query, string filter, int limit)
+    {
+        _logger?.Invoke($"[MCP] search_hybrid (query: \"{query}\", filter: \"{filter}\")", "INFO");
+
+        if (_db == null || _embedder == null)
+            return "Semantic system not initialized.";
+
+        // Sanitize the query for FTS5
+        string safeQuery = Regex.Replace(query, @"[^\w\s]", " ").Trim();
+
+        // Full-text search
+        var keywordResults = new List<SearchResult>();
+        try
+        {
+            if (!string.IsNullOrEmpty(safeQuery))
+                keywordResults = _db.Search(safeQuery, filter, 20);
+        }
+        catch (Exception ex)
+        {
+            _logger?.Invoke($"[BM25] Non-fatal error: {ex.Message}", "WARN");
+        }
+
+        // Semantic search
+        var semanticResults = new List<SearchResult>();
+        try
+        {
+            var queryVectors = _embedder.GenerateEmbeddings(query);
+            if (queryVectors.Count > 0)
+                semanticResults = _db.SearchByEmbedding(queryVectors[0], filter, 25);
+        }
+        catch (Exception ex)
+        {
+            _logger?.Invoke($"[ONNX] Non-fatal error: {ex.Message}", "WARN");
+        }
+
+        // Merge with Reciprocal Rank Fusion
+        var finalResults = FusionResults(keywordResults, semanticResults, limit);
+
+        if (finalResults.Count == 0)
+            return "No results found.";
+
+        var response = finalResults.Select(r => new
+        {
+            role            = r.Data.Sender == "human" ? "User" : "Assistant",
+            content         = r.Data.Text,
+            thinking        = r.Data.Thinking,
+            date            = r.Data.CreatedAt[..10],
+            relevance       = Math.Round(r.Score * 100, 2),
+            conversation_id = r.Data.ConversationUuid
+        });
+
+        return JsonSerializer.Serialize(response, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    // ── Reciprocal Rank Fusion ──────────────────────────────
+
+    /// <summary>
+    /// Merges two ranked result lists using Reciprocal Rank Fusion (RRF).
+    /// The constant k dampens the impact of high rankings outliers.
+    /// </summary>
+    private static List<(double Score, SearchResult Data)> FusionResults(
+        List<SearchResult> keyword,
+        List<SearchResult> semantic,
+        int limit)
+    {
         var rrfScores = new Dictionary<string, (double Score, SearchResult Data)>();
-        const double k = 60.0; // Standard RRF constant
+        const double k = 60.0;
 
-        // Process semantic results first
-        for (int i = 0; i < semanticResults.Count; i++)
+        for (int i = 0; i < semantic.Count; i++)
         {
-            var r = semanticResults[i];
-            rrfScores[r.Uuid] = (1.0 / (k + i + 1), r);
+            rrfScores[semantic[i].Uuid] = (1.0 / (k + i + 1), semantic[i]);
         }
 
-        // Merge with keyword results
-        for (int i = 0; i < keywordResults.Count; i++)
+        for (int i = 0; i < keyword.Count; i++)
         {
-            var r = keywordResults[i];
+            var r = keyword[i];
             if (rrfScores.TryGetValue(r.Uuid, out var existing))
-            {
-                rrfScores[r.Uuid] = (existing.Score + (1.0 / (k + i + 1)), existing.Data);
-            }
+                rrfScores[r.Uuid] = (existing.Score + 1.0 / (k + i + 1), existing.Data);
             else
-            {
                 rrfScores[r.Uuid] = (1.0 / (k + i + 1), r);
-            }
         }
 
-        // Sort by fused RRF score
-        var finalResults = rrfScores.Values
+        return rrfScores.Values
             .OrderByDescending(x => x.Score)
             .Take(limit)
             .ToList();
+    }
 
-        if (finalResults.Count == 0)
-            return $"Désolé, je n'ai rien trouvé pour '{query}'. Essaie avec d'autres termes.";
+    // ── Health check ────────────────────────────────────────
+
+    /// <summary>
+    /// Returns the current memory statistics (conversations, messages, embedding coverage).
+    /// </summary>
+    [McpServerTool, Description("Returns the Mnemos memory health status (stats and semantic indexing percentage).")]
+    public static string get_stats()
+    {
+        if (_db == null) return "Database inaccessible.";
+
+        var (convs, msgs) = _db.GetStats();
+        int embedded = _db.GetEmbeddedCount();
+        double percent = msgs > 0 ? Math.Round((double)embedded / msgs * 100, 1) : 0;
+
+        return $"Mnemos Memory:\n" +
+               $"- Conversations: {convs}\n" +
+               $"- Messages: {msgs}\n" +
+               $"- Semantic Indexing: {percent}% ({embedded}/{msgs})";
+    }
+
+    // ── Conversation retrieval ──────────────────────────────
+
+    /// <summary>
+    /// Retrieves recent messages from a specific conversation.
+    /// </summary>
+    /// <param name="conversation_uuid">The conversation UUID.</param>
+    /// <param name="n">Number of messages (default 15).</param>
+    [McpServerTool, Description("Retrieves the message thread of a specific conversation by its ID.")]
+    public static string get_recent_messages(
+        [Description("Conversation UUID")] string conversation_uuid,
+        [Description("Number of messages (default: 15)")] int n = 15)
+    {
+        if (_db == null) return "Database inaccessible.";
+
+        var messages = _db.GetRecentMessages(conversation_uuid, n);
+        if (messages.Count == 0) return "Conversation not found.";
 
         return JsonSerializer.Serialize(
-            finalResults.Select(r => new
+            messages.OrderBy(m => m.Index).Select(m => new
             {
-                role = r.Data.Sender == "human" ? "Utilisateur" : "Assistant",
-                content = r.Data.Text,
-                date = r.Data.CreatedAt[..10],
-                relevance = Math.Round(r.Score * 100, 2),
-                conversation_id = r.Data.ConversationUuid
+                sender   = m.Sender,
+                text     = m.Text,
+                date     = m.CreatedAt,
+                thinking = m.Thinking
             }),
             new JsonSerializerOptions { WriteIndented = true });
     }
 
-    [McpServerTool, Description("Donne l'état de santé de la mémoire de Mnemos (Stats et % d'indexation).")]
-    public static string get_stats()
-    {
-        if (_db == null) return "Base de données inaccessible.";
-        
-        var (convs, msgs) = _db.GetStats();
-        int embedded = _db.GetEmbeddedCount();
-        double percent = msgs > 0 ? Math.Round((double)embedded / msgs * 100, 1) : 0;
-        
-        return $"📊 Mémoire Mnemos :\n- Conversations : {convs}\n- Messages : {msgs}\n- Indexation Sémantique : {percent}% ({embedded}/{msgs})";
-    }
+    // ── File history ────────────────────────────────────────
 
-    [McpServerTool, Description("Récupère le fil d'une discussion spécifique via son ID.")]
-    public static string get_recent_messages(string conversation_uuid, int n = 15)
+    /// <summary>
+    /// Returns the complete version history of a virtual file tracked across messages.
+    /// </summary>
+    /// <param name="file_path">Virtual file path or name.</param>
+    [McpServerTool, Description("Returns the complete version history of a virtual file.")]
+    public static string get_file_history(
+        [Description("Virtual path/filename")] string file_path)
     {
-        if (_db == null) return "Base de données inaccessible.";
-        
-        var messages = _db.GetRecentMessages(conversation_uuid, n);
-        if (messages.Count == 0) return "Conversation introuvable.";
+        if (_db == null) return "Database inaccessible.";
 
-        return JsonSerializer.Serialize(
-            messages.OrderBy(m => m.Index).Select(m => new {
-                sender = m.Sender,
-                text = m.Text,
-                date = m.CreatedAt,
-                thinking = m.Thinking
-            }), new JsonSerializerOptions { WriteIndented = true });
+        var history = _db.GetFileHistory(file_path);
+        if (history.Count == 0) return $"No history found for file '{file_path}'.";
+
+        var response = new
+        {
+            file           = file_path,
+            total_versions = history.Count,
+            versions = history.Select((v, i) => new
+            {
+                version_number = i + 1,
+                date           = v.Date,
+                hash           = v.Hash[..8],
+                language       = v.Language,
+                code_preview   = v.Code.Length > 200 ? v.Code[..200] + "..." : v.Code,
+                full_code      = v.Code
+            })
+        };
+
+        return JsonSerializer.Serialize(response, new JsonSerializerOptions { WriteIndented = true });
     }
 }

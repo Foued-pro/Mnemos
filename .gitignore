@@ -1,9 +1,44 @@
+# --- Build .NET ---
+publish_final/
 bin/
 obj/
 /packages/
+
+# --- IDE Rider ---
+.idea/
+*.suo
+*.user
+*.DotSettings.user
 riderModule.iml
 /_ReSharper.Caches/
-*.user
-*.db
+
+# --- (mnemos-ui) ---
+mnemos-ui/node_modules/
+mnemos-ui/dist/
+mnemos-ui/dist-ssr/
+mnemos-ui/*.local
+
+# --- Node (Mnemos/) ---
+Mnemos/node_modules/
+Mnemos/package-lock.json
+Mnemos/package.json
+
+# Logs
 *.log
-.idea/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- Editor ---
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+*.ntvs*
+*.njsproj
+*.sw?
+
+# --- SQLite ---
+*.db
+*.sqlite

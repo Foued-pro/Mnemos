@@ -1,0 +1,16 @@
+﻿<Window x:Class="Mnemos.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="Mnemos" Height="720" Width="1080"
+        WindowStyle="None"
+        AllowsTransparency="False"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="CanResize"
+        Icon="logo.ico">
+
+    <Grid>
+        <wv2:WebView2 Name="webView"
+                      Source="http://localhost:5173" />
+    </Grid>
+</Window>

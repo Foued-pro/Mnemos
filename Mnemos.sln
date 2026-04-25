@@ -2,6 +2,8 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Mnemos", "Mnemos\Mnemos.csproj", "{62B83A23-9890-450F-9DE9-51A617161617}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Mnemos.App", "Mnemos.App\Mnemos.App.csproj", "{7AE0DA2C-6C17-486D-80A9-940F44BE98D4}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -12,5 +14,9 @@ Global
 		{62B83A23-9890-450F-9DE9-51A617161617}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{62B83A23-9890-450F-9DE9-51A617161617}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{62B83A23-9890-450F-9DE9-51A617161617}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7AE0DA2C-6C17-486D-80A9-940F44BE98D4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7AE0DA2C-6C17-486D-80A9-940F44BE98D4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7AE0DA2C-6C17-486D-80A9-940F44BE98D4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7AE0DA2C-6C17-486D-80A9-940F44BE98D4}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
