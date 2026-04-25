@@ -124,13 +124,13 @@ git clone https://github.com/Foued-pro/mnemos
 cd mnemos
 
 # Build the React frontend
-cd Mnemos-ui
+cd mnemos-ui
 npm install
 npm run build
 cd ..
 
 # Copy frontend to WPF app
-xcopy /E /Y Mnemos-ui\dist\* Mnemos.App\wwwroot\
+xcopy /E /Y mnemos-ui\dist\* Mnemos.App\wwwroot\
 
 # Publish everything to a single folder
 dotnet publish Mnemos -c Release -r win-x64 --self-contained true -o publish_final
