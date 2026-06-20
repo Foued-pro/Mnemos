@@ -3,7 +3,7 @@
 /// <summary>
 /// Reads V8-serialized values from a byte array and reconstructs
 /// the corresponding .NET object graph (primitives, strings,
-/// arrays, objects, dates, back-references).
+/// arrays, objects, dates, back-references, JS Maps).
 /// Based on the SSV (Script Serialization Value) opcode set
 /// found in Blink's idb_value_wrapping.cc and V8 serialization.h.
 /// </summary>
@@ -13,6 +13,14 @@ public class V8Deserializer
     private int _pos;
     private readonly List<object?> _refs = new(); // back-reference table
     private readonly Action<string>? _log;
+
+    // Set MNEMOS_DEBUG_DUMP=1 to dump full string-root payloads to %TEMP%
+    // for offline inspection (e.g. when a blob's root unexpectedly turns out
+    // to be a raw string instead of the expected Dictionary, such as
+    // TipTap editor-state blobs). Off by default to avoid writing large
+    // files to disk on every run.
+    private static readonly bool DebugDumpEnabled =
+        Environment.GetEnvironmentVariable("MNEMOS_DEBUG_DUMP") == "1";
 
     /// <summary>
     /// Initializes the deserializer with raw V8 bytes.
@@ -33,11 +41,33 @@ public class V8Deserializer
     {
         try
         {
-            return ReadValue();
+            var result = ReadValue();
+            _log?.Invoke($"[V8] Deserialize returned type={result?.GetType().Name ?? "null"} at final offset {_pos}/{_data.Length}, first byte was 0x{(_data.Length > 0 ? _data[0] : 0):X2}");
+
+            if (result is string s)
+            {
+                _log?.Invoke($"[V8] Root is a String, length={s.Length}, preview=\"{s[..Math.Min(200, s.Length)]}\"");
+
+                if (DebugDumpEnabled)
+                {
+                    try
+                    {
+                        string dumpPath = Path.Combine(Path.GetTempPath(), "mnemos_string_dump.json");
+                        File.WriteAllText(dumpPath, s);
+                        _log?.Invoke($"[V8] Full string dumped to {dumpPath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log?.Invoke($"[V8] Failed to dump string: {ex.Message}");
+                    }
+                }
+            }
+
+            return result;
         }
         catch (Exception ex)
         {
-            _log?.Invoke($"[V8] Parse failed at offset {_pos}: {ex.Message}");
+            _log?.Invoke($"[V8] Parse failed at offset {_pos}: {ex.Message}, first byte was 0x{(_data.Length > 0 ? _data[0] : 0):X2}");
             return null;
         }
     }
@@ -183,8 +213,29 @@ public class V8Deserializer
                 case 0x5C:                          // '\' — host object (e.g. Blink internal), ignored
                     return null;
 
+                case 0x3B:                          // ';' — kBeginJSMap
+                {
+                    // V8 serializes native JS Map objects with this tag, distinct from
+                    // the plain-object tag 0x6F. Without this case, the deserializer
+                    // fell through to `default` and returned null without consuming any
+                    // bytes, desyncing the cursor for the rest of the stream — this was
+                    // the root cause of the "[V8] Unknown tag" / "Parse failed" errors.
+                    var map = new Dictionary<object, object?>(); // keys aren't necessarily strings in a JS Map
+                    _refs.Add(map);
+                    while (_pos < _data.Length && _data[_pos] != 0x3A) // 0x3A = kEndJSMap
+                    {
+                        var key = ReadValue();
+                        var val = ReadValue();
+                        if (key != null) map[key] = val;
+                    }
+                    _pos++;          // skip 0x3A
+                    ReadVarint();    // trailing count (numProperties * 2), same pattern as kEndDenseJSArray
+                    return map;
+                }
+
                 // --- Unknown opcode — skip silently ---
                 default:
+                    _log?.Invoke($"[V8] Unknown tag 0x{tag:X2} at offset {_pos - 1}");
                     return null;
             }
         }
@@ -211,4 +262,4 @@ public class V8Deserializer
 
         return result;
     }
-} 
+}

@@ -1,10 +1,19 @@
-﻿
-using Mnemos.Models;
+﻿using Mnemos.Models;
 
 namespace Mnemos.Database;
 
 public partial class MnemosDb
 {
+    // Hard cap on how many embeddings get pulled and scored per semantic
+    // search call. Without this, SearchByEmbedding scans the entire
+    // message_embeddings table on every call — fine at a few hundred rows,
+    // but it scales linearly with the size of the database and becomes the
+    // dominant cost once the index grows into the thousands (especially
+    // on CPU fallback when the ONNX CUDA provider fails to load). Capping
+    // to the most recent N candidates keeps each search bounded while still
+    // covering the window of context that matters most in practice.
+    private const int MaxEmbeddingCandidates = 3000;
+
     /// <summary>
     /// Performs a full-text search on messages using FTS5 with BM25 scoring,
     /// optionally filtered by programming language. Results are ranked
@@ -69,7 +78,8 @@ public partial class MnemosDb
 
     /// <summary>
     /// Performs semantic search by computing cosine similarity between
-    /// a query embedding and all stored message embeddings.
+    /// a query embedding and the most recent stored message embeddings
+    /// (capped at <see cref="MaxEmbeddingCandidates"/> to bound per-query cost).
     /// Optionally filtered by programming language.
     /// </summary>
     /// <param name="queryEmbedding">The query embedding vector (384 dimensions).</param>
@@ -90,12 +100,17 @@ public partial class MnemosDb
             cmd.Parameters.AddWithValue("@filter", filter);
         }
 
+        // ORDER BY + LIMIT pushed down into SQL: avoids materializing the
+        // entire embeddings table in managed memory on every search.
         cmd.CommandText = $@"
             SELECT m.uuid, m.conversation_uuid, m.sender, m.text, m.thinking, m.created_at, e.embedding
             FROM messages m
             JOIN message_embeddings e ON m.uuid = e.message_uuid
             {joinClause}
-            WHERE m.tier = 1 {whereClause};";
+            WHERE m.tier = 1 {whereClause}
+            ORDER BY m.created_at DESC
+            LIMIT @maxCandidates;";
+        cmd.Parameters.AddWithValue("@maxCandidates", MaxEmbeddingCandidates);
 
         var chunks = new List<(string uuid, string conv, string sender, string text, string? thinking, long date, float[] emb)>();
 
@@ -116,7 +131,11 @@ public partial class MnemosDb
             }
         }
 
+        // Cosine similarity scoring is the hot loop (up to MaxEmbeddingCandidates
+        // vectors x 384 dims each). Parallelized across cores since each
+        // comparison is independent and read-only over shared state.
         return chunks
+            .AsParallel()
             .Select(c => new { c, score = CosineSimilarity(queryEmbedding, c.emb) })
             .Where(x => x.score > 0.4f)
             .GroupBy(x => x.c.uuid)
@@ -132,17 +151,19 @@ public partial class MnemosDb
 
     /// <summary>
     /// Computes the cosine similarity between two embedding vectors.
+    /// Uses System.Numerics.Tensors for SIMD-accelerated dot product and
+    /// norm computation instead of a scalar loop.
     /// </summary>
     private static float CosineSimilarity(float[] a, float[] b)
     {
-        float dot = 0, normA = 0, normB = 0;
-        for (int i = 0; i < a.Length; i++)
-        {
-            dot += a[i] * b[i];
-            normA += a[i] * a[i];
-            normB += b[i] * b[i];
-        }
-        return dot / (MathF.Sqrt(normA) * MathF.Sqrt(normB) + 1e-9f);
+        var spanA = a.AsSpan();
+        var spanB = b.AsSpan();
+
+        float dot = System.Numerics.Tensors.TensorPrimitives.Dot(spanA, spanB);
+        float normA = MathF.Sqrt(System.Numerics.Tensors.TensorPrimitives.Dot(spanA, spanA));
+        float normB = MathF.Sqrt(System.Numerics.Tensors.TensorPrimitives.Dot(spanB, spanB));
+
+        return dot / (normA * normB + 1e-9f);
     }
 
     /// <summary>

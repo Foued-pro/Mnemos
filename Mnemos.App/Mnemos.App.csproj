@@ -7,20 +7,24 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <UseWPF>true</UseWPF>
         <ApplicationIcon>logo.ico</ApplicationIcon>
+        <SelfContained>true</SelfContained>
+        <PublishSingleFile>false</PublishSingleFile>
+        <PublishTrimmed>false</PublishTrimmed>
+        <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     </PropertyGroup>
 
     <ItemGroup>
-      <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3912.50" />
+        <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3912.50" />
     </ItemGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\Mnemos\Mnemos.csproj" />
+        <ProjectReference Include="..\Mnemos\Mnemos.csproj" />
     </ItemGroup>
 
     <ItemGroup>
-      <None Remove="logo.ico" />
-      <Resource Include="logo.ico" />
-      <None Remove="favicon.ico" />
+        <None Remove="logo.ico" />
+        <Resource Include="logo.ico" />
+        <None Remove="favicon.ico" />
     </ItemGroup>
 
     <ItemGroup>

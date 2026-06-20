@@ -29,6 +29,7 @@ internal static class Program
 
     private static readonly MnemosDb Db = new(DbPath, msg => Log(msg, "DB"));
     private static EmbeddingEngine? _embedder;
+    private static CodeIndexDb? _codeIndexDb;      
 
     // ---------- Logging ----------
 
@@ -102,6 +103,19 @@ internal static class Program
             // 3. Register tools for the MCP server
             McpTools.Init(Db, _embedder, (msg, level) => Log(msg, level));
 
+            // 3b. Initialize Code Index
+            try
+            {
+                string projectRoot = Directory.GetCurrentDirectory();
+                _codeIndexDb = new CodeIndexDb(projectRoot);
+                McpTools.InitCodeIndex(_codeIndexDb);
+                Log($"Code index ready at {projectRoot}");
+                
+            }
+            catch (Exception ex)
+            {
+                Log($"Code index init failed: {ex.Message}", "WARN");
+            }
             // 4. Start background embedding thread (if engine loaded)
             if (_embedder != null)
                 StartEmbeddingThread(cts.Token);
@@ -130,7 +144,6 @@ internal static class Program
         }
         finally
         {
-            _appMutex?.ReleaseMutex();
             _appMutex?.Dispose();
         }
     }
@@ -224,15 +237,24 @@ internal static class Program
     {
         try
         {
-            byte[]? v8Data = SnappyDecompressor.Decompress(path);
+            byte[]? v8Data = SnappyDecompressor.Decompress(path, msg => Log(msg, "SNAPPY"));
             if (v8Data == null) return [];
 
             var deserializer = new V8Deserializer(v8Data, msg => Log(msg, "DEBUG"));
             var root = deserializer.Deserialize();
 
+            // Some IndexedDB blobs are not conversations: e.g., the state of
+            // the TipTap editor (chat input area) is serialized as a string
+            // raw JSON at the root, not as a clientState/queries dictionary.
+            if (root is string)
+            {
+                Log($"Blob {Path.GetFileName(path)} is an editor-state blob (string root), skipping.", "BLOB");
+                return [];
+            }
+
             return ConversationExtractor.Extract(root, msg =>
             {
-                if (msg.Contains("FOUND"))
+                if (msg.Contains("FOUND") || msg.Contains("[EXTRACT]") || msg.Contains("[FILE]") || msg.Contains("[V8]"))
                     Log(msg, "BLOB");
             });
         }
